@@ -1,0 +1,19 @@
+# Telegram Bot
+python-telegram-bot==20.7
+python-telegram-bot[job-queue]==20.7
+
+# HTTP requests
+aiohttp==3.9.1
+requests==2.31.0
+
+# Google Sheets (опционально)
+gspread==5.12.4
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+
+# Database
+# SQLite3 входит в стандартную библиотеку Python
+
+# Utilities
+python-dotenv==1.0.0
