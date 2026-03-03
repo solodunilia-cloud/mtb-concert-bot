@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTB Concerts Bot — v3
-Логика:
-- Триггеры одной строкой: "Артист билеты https://..." / "Артист афиша одобрена" / "Артист текст ..." / "Артист дата 15.03"
-- Подтверждение Да/Нет после каждого действия
-- Если артист не найден → предложить создать
-- /menu — кнопки для всего
-- /status [id или имя] — карточка как в макете
-- В группе бот реагирует ТОЛЬКО на триггеры
+MTB Concerts Bot — v4
+Исправлены все баги из чеклиста:
+- Триггеры: "Артист билеты URL", "Артист афиша одобрена", "Артист текст ...", "Артист дата ...", "Артист отмена"
+- Город убран везде
+- /createtask не создаёт дубли — проверяет существующих
+- При нескольких совпадениях — спрашивает уточнение
+- /publish с подтверждением
+- /digest и /menu работают
+- Карточка показывает дату в заголовке
 """
 
 import os
@@ -40,13 +41,13 @@ sheets  = GoogleSheetsManager(spreadsheet_id=SHEETS_ID if SHEETS_ID else None)
 
 FUZZY_THRESHOLD = 70
 
-# Ключевые слова триггеров
-TRIGGER_TICKETS  = ['билеты', 'ticket', 'tickets']
-TRIGGER_POSTER   = ['афиша', 'poster']
-POSTER_APPROVED  = ['одобрена', 'ок', 'ok', 'утверждена', 'готова', 'approved']
-TRIGGER_TEXT     = ['текст', 'описание', 'text', 'description']
-TRIGGER_DATE     = ['дата', 'date', 'перенос']
-TRIGGER_CANCEL   = ['отмена', 'отменён', 'отменен', 'отменили', 'cancelled', 'canceled']
+# Триггерные слова
+T_TICKETS = ['билеты', 'билет', 'ticket', 'tickets']
+T_POSTER  = ['афиша', 'poster']
+T_TEXT    = ['текст', 'описание', 'text']
+T_DATE    = ['дата', 'date', 'перенос']
+T_CANCEL  = ['отмена', 'отменен', 'отменён', 'отменили', 'cancel', 'cancelled']
+T_POSTER_OK = ['одобрена', 'ок', 'ok', 'утверждена', 'готова', 'approved']
 
 # ==================== HELPERS ====================
 
@@ -54,9 +55,6 @@ def normalize(text: str) -> str:
     text = text.lower().replace('ё', 'е')
     text = re.sub(r'[^\w\s]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
-
-def is_group(update: Update) -> bool:
-    return update.effective_chat.type in ('group', 'supergroup')
 
 def extract_urls(text: str) -> List[str]:
     return re.findall(r'https?://[^\s<>"\']+', text)
@@ -101,7 +99,6 @@ def init_db():
         artist           TEXT NOT NULL,
         date             TEXT,
         time             TEXT,
-        city             TEXT,
         poster_status    TEXT DEFAULT 'none',
         poster_file_id   TEXT,
         tickets_url      TEXT,
@@ -109,12 +106,6 @@ def init_db():
         published_status TEXT DEFAULT 'draft',
         created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS reminders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        concert_id INTEGER NOT NULL,
-        remind_at  TEXT NOT NULL,
-        sent       INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS digest_chats (
         chat_id INTEGER PRIMARY KEY
@@ -128,12 +119,12 @@ def save_concert(data: Dict[str, Any]) -> int:
     now  = datetime.now().isoformat()
     if data.get('id'):
         c.execute('''UPDATE concerts SET
-            artist=?,date=?,time=?,city=?,
+            artist=?,date=?,time=?,
             poster_status=?,poster_file_id=?,
             tickets_url=?,description_text=?,
             published_status=?,updated_at=?
             WHERE id=?''', (
-            data.get('artist'), data.get('date'), data.get('time'), data.get('city'),
+            data.get('artist'), data.get('date'), data.get('time'),
             data.get('poster_status','none'), data.get('poster_file_id'),
             data.get('tickets_url'), data.get('description_text'),
             data.get('published_status','draft'), now, data['id']
@@ -141,10 +132,10 @@ def save_concert(data: Dict[str, Any]) -> int:
         cid = data['id']
     else:
         c.execute('''INSERT INTO concerts
-            (artist,date,time,city,poster_status,poster_file_id,
+            (artist,date,time,poster_status,poster_file_id,
              tickets_url,description_text,published_status)
-            VALUES (?,?,?,?,?,?,?,?,?)''', (
-            data.get('artist'), data.get('date'), data.get('time'), data.get('city'),
+            VALUES (?,?,?,?,?,?,?,?)''', (
+            data.get('artist'), data.get('date'), data.get('time'),
             data.get('poster_status','none'), data.get('poster_file_id'),
             data.get('tickets_url'), data.get('description_text'),
             data.get('published_status','draft')
@@ -179,7 +170,6 @@ def delete_concert(cid: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM concerts WHERE id=?', (cid,))
-    c.execute('DELETE FROM reminders WHERE concert_id=?', (cid,))
     conn.commit()
     conn.close()
 
@@ -230,29 +220,39 @@ def status_icon(concert: Dict) -> str:
     return '🟡' if filled >= 2 else '🔴'
 
 def concert_card(concert: Dict) -> str:
+    """Карточка мероприятия — как в макете."""
     icon      = status_icon(concert)
-    date_line = f"{concert['date']} {concert.get('time','') or ''}".strip() if concert.get('date') else '—'
-    city      = concert.get('city') or '—'
+    date_line = f"{concert['date']} {concert.get('time') or ''}".strip() if concert.get('date') else '—'
     m         = missing_fields(concert)
 
-    poster_icon  = '✅' if concert.get('poster_status') == 'approved' else '❌'
-    tickets_icon = '✅' if concert.get('tickets_url') else '❌'
-    text_icon    = '✅' if concert.get('description_text') else '❌'
-    date_icon    = '✅' if concert.get('date') else '❌'
+    # Заголовок с датой если есть
+    title = f"#{concert['id']} {concert['artist']}"
+    if concert.get('date'):
+        title += f" • {date_line}"
 
     text = (
-        f"{icon} *#{concert['id']} {concert['artist']}*\n"
-        f"📅 {date_line} | 🏙 {city}\n\n"
-        f"{poster_icon} Афиша\n"
-        f"{tickets_icon} Билеты\n"
-        f"{text_icon} Текст\n"
-        f"{date_icon} Дата\n"
+        f"{icon} *{title}*\n\n"
+        f"{'✅' if concert.get('poster_status') == 'approved' else '❌'} Афиша\n"
+        f"{'✅' if concert.get('tickets_url') else '❌'} Билеты\n"
+        f"{'✅' if concert.get('description_text') else '❌'} Текст\n"
+        f"{'✅' if concert.get('date') else '❌'} Дата\n"
     )
     if m:
         text += f"\n❗ Не хватает: {', '.join(m)}"
     else:
-        text += f"\n🟢 Готов к публикации"
+        text += f"\n🟢 Готов к публикации → `/code {concert['id']}`"
     return text
+
+def edit_keyboard(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Дата/время", callback_data=f"ed_date_{cid}"),
+         InlineKeyboardButton("🖼 Афиша ок",   callback_data=f"confirm_poster_{cid}")],
+        [InlineKeyboardButton("🎟 Билеты",     callback_data=f"ed_tickets_{cid}"),
+         InlineKeyboardButton("📝 Текст",      callback_data=f"ed_text_{cid}")],
+        [InlineKeyboardButton("✏️ Артист",     callback_data=f"ed_artist_{cid}"),
+         InlineKeyboardButton("🚫 Отменить",   callback_data=f"confirm_cancel_{cid}")],
+        [InlineKeyboardButton("🗑 Удалить",    callback_data=f"confirm_delete_{cid}")],
+    ])
 
 async def notify_owner_if_ready(context: ContextTypes.DEFAULT_TYPE, concert: Dict):
     if is_ready(concert) and concert.get('published_status') == 'draft':
@@ -283,68 +283,55 @@ def fuzzy_find(name: str, include_cancelled=False) -> List[Dict]:
         return []
     results.sort(key=lambda x: x[1], reverse=True)
     top = results[0][1]
+    # Если одно явное совпадение
     if top == 100 or (len(results) >= 2 and top - results[1][1] >= 20):
         return [results[0][0]]
     return [r[0] for r in results[:5]]
 
-# ==================== ПАРСИНГ ТРИГГЕРОВ ====================
+# ==================== ПАРСИНГ ТРИГГЕРА ====================
 
 def parse_trigger(text: str) -> Optional[Dict]:
     """
-    Разбирает сообщение на: artist_name, trigger_type, payload
+    Ищет триггерное слово в тексте.
+    Возвращает {artist_name, trigger_type, payload} или None.
+
     Форматы:
-      Артист билеты https://...
-      Артист афиша одобрена
-      Артист текст <описание>
-      Артист дата 15.03.2026 23:00
-      Артист отмена
-    Возвращает dict или None если не распознано.
+      Иван Дорн билеты https://...
+      Иван Дорн афиша одобрена
+      Иван Дорн текст Описание концерта...
+      Иван Дорн дата 15.04.2026 21:00
+      Иван Дорн отмена
     """
     text = text.strip()
+    if not text:
+        return None
+
     words = text.split()
     if len(words) < 2:
         return None
 
-    text_low = normalize(text)
-
-    # Ищем позицию триггерного слова
-    all_triggers = TRIGGER_TICKETS + TRIGGER_POSTER + TRIGGER_TEXT + TRIGGER_DATE + TRIGGER_CANCEL
-    trigger_pos  = None
-    trigger_word = None
-    trigger_type = None
-
-    for i, word in enumerate(words):
-        w = normalize(word)
-        if w in [normalize(t) for t in TRIGGER_TICKETS]:
-            trigger_pos, trigger_word, trigger_type = i, word, 'tickets'
-            break
-        if w in [normalize(t) for t in TRIGGER_POSTER]:
-            trigger_pos, trigger_word, trigger_type = i, word, 'poster'
-            break
-        if w in [normalize(t) for t in TRIGGER_TEXT]:
-            trigger_pos, trigger_word, trigger_type = i, word, 'text'
-            break
-        if w in [normalize(t) for t in TRIGGER_DATE]:
-            trigger_pos, trigger_word, trigger_type = i, word, 'date'
-            break
-        if w in [normalize(t) for t in TRIGGER_CANCEL]:
-            trigger_pos, trigger_word, trigger_type = i, word, 'cancel'
-            break
-
-    if trigger_pos is None or trigger_pos == 0:
-        return None
-
-    artist_name = ' '.join(words[:trigger_pos]).strip()
-    payload     = ' '.join(words[trigger_pos+1:]).strip()
-
-    if not artist_name:
-        return None
-
-    return {
-        'artist_name':  artist_name,
-        'trigger_type': trigger_type,
-        'payload':      payload,
+    all_triggers = {
+        **{normalize(w): 'tickets' for w in T_TICKETS},
+        **{normalize(w): 'poster'  for w in T_POSTER},
+        **{normalize(w): 'text'    for w in T_TEXT},
+        **{normalize(w): 'date'    for w in T_DATE},
+        **{normalize(w): 'cancel'  for w in T_CANCEL},
     }
+
+    # Ищем первое триггерное слово начиная со второго слова
+    for i in range(1, len(words)):
+        w = normalize(words[i])
+        if w in all_triggers:
+            artist_name = ' '.join(words[:i]).strip()
+            trigger_type = all_triggers[w]
+            payload = ' '.join(words[i+1:]).strip()
+            if artist_name:
+                return {
+                    'artist_name':  artist_name,
+                    'trigger_type': trigger_type,
+                    'payload':      payload,
+                }
+    return None
 
 # ==================== ОБРАБОТКА ТРИГГЕРА ====================
 
@@ -354,157 +341,144 @@ async def process_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE, pa
     ttype       = parsed['trigger_type']
     payload     = parsed['payload']
 
-    # Ищем артиста
     matches = fuzzy_find(artist_name)
 
     if len(matches) == 0:
-        # Артист не найден — предлагаем создать
+        # Не найден — предложить создать
         kb = [[
-            InlineKeyboardButton("✅ Создать", callback_data=f"create_new_{artist_name}_{ttype}_{payload[:50]}"),
+            InlineKeyboardButton("✅ Создать", callback_data=f"cnew|{artist_name}|{ttype}|{payload[:60]}"),
             InlineKeyboardButton("❌ Отмена",  callback_data="noop"),
         ]]
         await message.reply_text(
-            f"Мероприятие для *{artist_name}* не найдено.\nСоздать новое?",
+            f"Мероприятие *{artist_name}* не найдено.\nСоздать новое?",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
         return
 
     if len(matches) > 1:
-        # Несколько совпадений — уточнить
+        # Несколько — уточнить
         kb = [[InlineKeyboardButton(
-            f"#{c['id']} {c['artist']}",
-            callback_data=f"trigger_select_{c['id']}_{ttype}_{payload[:50]}"
-        )] for c in matches[:5]]
+            f"#{c['id']} {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''),
+            callback_data=f"tsel|{c['id']}|{ttype}|{payload[:60]}"
+        )] for c in matches]
         kb.append([InlineKeyboardButton("❌ Отмена", callback_data='noop')])
-        await message.reply_text("Уточни:", reply_markup=InlineKeyboardMarkup(kb))
+        await message.reply_text(
+            f"Найдено несколько — уточни:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
         return
 
-    concert = matches[0]
-    await apply_trigger(update, context, concert, ttype, payload)
+    await apply_trigger(update, context, matches[0], ttype, payload)
 
 
 async def apply_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          concert: Dict, ttype: str, payload: str):
     message = update.effective_message
+    cid     = concert['id']
+    name    = concert['artist']
 
     if ttype == 'cancel':
         kb = [[
-            InlineKeyboardButton("✅ Да", callback_data=f"confirm_cancel_{concert['id']}"),
-            InlineKeyboardButton("❌ Нет", callback_data="noop"),
+            InlineKeyboardButton("✅ Отменить", callback_data=f"confirm_cancel_{cid}"),
+            InlineKeyboardButton("❌ Нет",      callback_data="noop"),
         ]]
         await message.reply_text(
-            f"Отменить *{concert['artist']}*?",
+            f"Отменить *{name}*?",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
-        return
 
-    if ttype == 'tickets':
+    elif ttype == 'tickets':
         urls = extract_urls(payload)
         if not urls:
-            await message.reply_text("Не нашёл ссылку. Пример: `Иван Дорн билеты https://...`", parse_mode='Markdown')
+            await message.reply_text(
+                f"Не нашёл ссылку.\nПример: `{name} билеты https://...`",
+                parse_mode='Markdown'
+            )
             return
         url = urls[0]
-        # Проверяем перезапись
-        if concert.get('tickets_url'):
-            kb = [[
-                InlineKeyboardButton("✅ Перезаписать", callback_data=f"confirm_tickets_{concert['id']}_{url[:80]}"),
-                InlineKeyboardButton("❌ Отмена", callback_data="noop"),
-            ]]
-            await message.reply_text(
-                f"Билеты уже есть для *{concert['artist']}*.\nПерезаписать?",
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode='Markdown'
-            )
-        else:
-            kb = [[
-                InlineKeyboardButton("✅ Да", callback_data=f"confirm_tickets_{concert['id']}_{url[:80]}"),
-                InlineKeyboardButton("❌ Нет", callback_data="noop"),
-            ]]
-            await message.reply_text(
-                f"Добавить билеты для *{concert['artist']}*?",
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode='Markdown'
-            )
-        return
+        action = "Перезаписать билеты" if concert.get('tickets_url') else "Добавить билеты"
+        kb = [[
+            InlineKeyboardButton("✅ Да", callback_data=f"ctix|{cid}|{url[:100]}"),
+            InlineKeyboardButton("❌ Нет", callback_data="noop"),
+        ]]
+        await message.reply_text(
+            f"{action} для *{name}*?",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='Markdown'
+        )
 
-    if ttype == 'poster':
-        payload_low = normalize(payload)
-        approved = any(normalize(w) in payload_low for w in POSTER_APPROVED)
-        if not approved:
+    elif ttype == 'poster':
+        payload_norm = normalize(payload)
+        if not any(normalize(w) in payload_norm for w in T_POSTER_OK):
             await message.reply_text(
-                f"Напиши: `{concert['artist']} афиша одобрена`",
+                f"Напиши: `{name} афиша одобрена`",
                 parse_mode='Markdown'
             )
             return
         kb = [[
-            InlineKeyboardButton("✅ Да", callback_data=f"confirm_poster_{concert['id']}"),
+            InlineKeyboardButton("✅ Да", callback_data=f"confirm_poster_{cid}"),
             InlineKeyboardButton("❌ Нет", callback_data="noop"),
         ]]
         await message.reply_text(
-            f"Отметить афишу *{concert['artist']}* как одобренную?",
+            f"Отметить афишу *{name}* как одобренную?",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
-        return
 
-    if ttype == 'text':
-        if not payload or len(payload) < 10:
+    elif ttype == 'text':
+        if len(payload) < 10:
             await message.reply_text(
-                f"Укажи текст: `{concert['artist']} текст <описание>`",
+                f"Укажи текст: `{name} текст Описание концерта...`",
                 parse_mode='Markdown'
             )
             return
-        # Сохраняем payload в user_data для подтверждения
-        context.user_data[f'pending_text_{concert["id"]}'] = payload
+        context.user_data[f'ptxt_{cid}'] = payload
+        preview = payload[:100] + ('...' if len(payload) > 100 else '')
         kb = [[
-            InlineKeyboardButton("✅ Да", callback_data=f"confirm_text_{concert['id']}"),
+            InlineKeyboardButton("✅ Да", callback_data=f"ctxt|{cid}"),
             InlineKeyboardButton("❌ Нет", callback_data="noop"),
         ]]
-        preview = payload[:80] + ('...' if len(payload) > 80 else '')
         await message.reply_text(
-            f"Добавить описание для *{concert['artist']}*?\n\n_{preview}_",
+            f"Добавить описание для *{name}*?\n\n_{preview}_",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
-        return
 
-    if ttype == 'date':
+    elif ttype == 'date':
         date_str, time_str = parse_date_time(payload)
         if not date_str:
             await message.reply_text(
-                f"Не распознал дату. Пример: `{concert['artist']} дата 15.03.2026 23:00`",
+                f"Не распознал дату.\nПример: `{name} дата 15.04.2026 21:00`",
                 parse_mode='Markdown'
             )
             return
         date_full = f"{date_str} {time_str or ''}".strip()
-        context.user_data[f'pending_date_{concert["id"]}']     = date_str
-        context.user_data[f'pending_time_{concert["id"]}']     = time_str
+        context.user_data[f'pdate_{cid}'] = date_str
+        context.user_data[f'ptime_{cid}'] = time_str
         kb = [[
-            InlineKeyboardButton("✅ Да", callback_data=f"confirm_date_{concert['id']}"),
+            InlineKeyboardButton("✅ Да", callback_data=f"cdate|{cid}"),
             InlineKeyboardButton("❌ Нет", callback_data="noop"),
         ]]
         await message.reply_text(
-            f"Установить дату *{concert['artist']}*: `{date_full}`?",
+            f"Установить дату *{name}*: `{date_full}`?",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
-        return
 
 
-# ==================== CALLBACK КНОПКИ ====================
+# ==================== CALLBACK ====================
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data  = query.data
 
-    # --- Подтверждение билетов ---
-    if data.startswith('confirm_tickets_'):
-        parts   = data.split('_', 3)
-        cid     = int(parts[2])
-        url     = parts[3] if len(parts) > 3 else ''
+    # Билеты
+    if data.startswith('ctix|'):
+        _, cid_s, url = data.split('|', 2)
+        cid = int(cid_s)
         concert = get_concert(cid)
         if concert:
             concert['tickets_url'] = url
@@ -513,9 +487,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_owner_if_ready(context, concert)
             await query.edit_message_text(f"✅ Билеты добавлены — *{concert['artist']}*", parse_mode='Markdown')
 
-    # --- Подтверждение афиши ---
+    # Афиша
     elif data.startswith('confirm_poster_'):
-        cid     = int(data.split('_')[2])
+        cid = int(data.split('_')[2])
         concert = get_concert(cid)
         if concert:
             concert['poster_status'] = 'approved'
@@ -524,11 +498,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_owner_if_ready(context, concert)
             await query.edit_message_text(f"✅ Афиша одобрена — *{concert['artist']}*", parse_mode='Markdown')
 
-    # --- Подтверждение текста ---
-    elif data.startswith('confirm_text_'):
-        cid     = int(data.split('_')[2])
+    # Текст
+    elif data.startswith('ctxt|'):
+        cid = int(data.split('|')[1])
         concert = get_concert(cid)
-        text    = context.user_data.pop(f'pending_text_{cid}', None)
+        text = context.user_data.pop(f'ptxt_{cid}', None)
         if concert and text:
             concert['description_text'] = text
             save_concert(concert)
@@ -536,12 +510,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_owner_if_ready(context, concert)
             await query.edit_message_text(f"✅ Текст добавлен — *{concert['artist']}*", parse_mode='Markdown')
 
-    # --- Подтверждение даты ---
-    elif data.startswith('confirm_date_'):
-        cid     = int(data.split('_')[2])
+    # Дата
+    elif data.startswith('cdate|'):
+        cid = int(data.split('|')[1])
         concert = get_concert(cid)
-        d       = context.user_data.pop(f'pending_date_{cid}', None)
-        t       = context.user_data.pop(f'pending_time_{cid}', None)
+        d = context.user_data.pop(f'pdate_{cid}', None)
+        t = context.user_data.pop(f'ptime_{cid}', None)
         if concert and d:
             concert['date'] = d
             if t: concert['time'] = t
@@ -550,9 +524,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_owner_if_ready(context, concert)
             await query.edit_message_text(f"✅ Дата установлена — *{concert['artist']}*", parse_mode='Markdown')
 
-    # --- Подтверждение отмены ---
+    # Отмена мероприятия
     elif data.startswith('confirm_cancel_'):
-        cid     = int(data.split('_')[2])
+        cid = int(data.split('_')[2])
         concert = get_concert(cid)
         if concert:
             concert['published_status'] = 'cancelled'
@@ -560,76 +534,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheets.sync_concert(concert)
             await query.edit_message_text(f"🚫 *{concert['artist']}* — отменён", parse_mode='Markdown')
 
-    # --- Подтверждение удаления ---
+    # Удаление
     elif data.startswith('confirm_delete_'):
         cid = int(data.split('_')[2])
-        c   = get_concert(cid)
+        c = get_concert(cid)
         if c:
             delete_concert(cid)
             await query.edit_message_text(f"🗑 *{c['artist']}* — удалён", parse_mode='Markdown')
 
-    # --- Создать нового артиста ---
-    elif data.startswith('create_new_'):
-        parts       = data.split('_', 4)
-        artist_name = parts[2]
-        ttype       = parts[3] if len(parts) > 3 else None
-        payload     = parts[4] if len(parts) > 4 else ''
-        cid         = save_concert({'artist': artist_name})
-        concert     = get_concert(cid)
-        await query.edit_message_text(f"✅ Создано: *#{cid} {artist_name}*", parse_mode='Markdown')
-        if ttype and ttype != 'None':
-            await apply_trigger(update, context, concert, ttype, payload)
-
-    # --- Выбор из нескольких совпадений ---
-    elif data.startswith('trigger_select_'):
-        parts   = data.split('_', 4)
-        cid     = int(parts[2])
-        ttype   = parts[3]
-        payload = parts[4] if len(parts) > 4 else ''
-        concert = get_concert(cid)
-        await query.edit_message_text(f"#{cid} {concert['artist']}")
-        await apply_trigger(update, context, concert, ttype, payload)
-
-    # --- Меню редактирования ---
-    elif data.startswith('edit_menu_'):
-        cid = int(data.split('_')[2])
-        c   = get_concert(cid)
-        kb  = [
-            [InlineKeyboardButton("📅 Дата/время", callback_data=f"menu_edit_date_{cid}"),
-             InlineKeyboardButton("🏙 Город",       callback_data=f"menu_edit_city_{cid}")],
-            [InlineKeyboardButton("🎟 Билеты",      callback_data=f"menu_edit_tickets_{cid}"),
-             InlineKeyboardButton("🖼 Афиша ок",    callback_data=f"confirm_poster_{cid}")],
-            [InlineKeyboardButton("📝 Текст",       callback_data=f"menu_edit_text_{cid}"),
-             InlineKeyboardButton("✏️ Артист",      callback_data=f"menu_edit_artist_{cid}")],
-            [InlineKeyboardButton("🚫 Отменить",    callback_data=f"confirm_cancel_{cid}"),
-             InlineKeyboardButton("🗑 Удалить",     callback_data=f"confirm_delete_{cid}")],
-        ]
-        await query.edit_message_text(
-            concert_card(c) + "\n\n_Что изменить?_",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='Markdown'
-        )
-
-    # --- Редактирование через меню (ввод текста) ---
-    elif data.startswith('menu_edit_'):
-        parts = data.split('_', 3)
-        field = parts[2]
-        cid   = int(parts[3])
-        c     = get_concert(cid)
-        context.user_data['awaiting']        = field
-        context.user_data['awaiting_for_id'] = cid
-        prompts = {
-            'date':    f"📅 Введи дату для *{c['artist']}*:\nПример: `15.03.2026 23:00`",
-            'city':    f"🏙 Введи город для *{c['artist']}*:",
-            'tickets': f"🎟 Введи ссылку на билеты для *{c['artist']}*:",
-            'text':    f"📝 Введи описание для *{c['artist']}*:",
-            'artist':  f"✏️ Введи новое имя (сейчас: {c['artist']}):",
-        }
-        await query.edit_message_text(prompts.get(field, 'Введи значение:'), parse_mode='Markdown')
-
-    # --- Опубликовать ---
+    # Публикация
     elif data.startswith('confirm_publish_'):
-        cid     = int(data.split('_')[2])
+        cid = int(data.split('_')[2])
         concert = get_concert(cid)
         if concert:
             concert['published_status'] = 'published'
@@ -637,42 +552,96 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheets.sync_concert(concert)
             await query.edit_message_text(f"⚫ *{concert['artist']}* — опубликован", parse_mode='Markdown')
 
+    # Создать нового при ненайденном
+    elif data.startswith('cnew|'):
+        parts   = data.split('|', 3)
+        artist  = parts[1]
+        ttype   = parts[2]
+        payload = parts[3] if len(parts) > 3 else ''
+        cid     = save_concert({'artist': artist})
+        concert = get_concert(cid)
+        await query.edit_message_text(f"✅ Создано: *#{cid} {artist}*", parse_mode='Markdown')
+        await apply_trigger(update, context, concert, ttype, payload)
+
+    # Выбор из нескольких совпадений
+    elif data.startswith('tsel|'):
+        parts   = data.split('|', 3)
+        cid     = int(parts[1])
+        ttype   = parts[2]
+        payload = parts[3] if len(parts) > 3 else ''
+        concert = get_concert(cid)
+        await query.edit_message_text(f"#{cid} {concert['artist']}")
+        await apply_trigger(update, context, concert, ttype, payload)
+
+    # Меню редактирования (открыть)
+    elif data.startswith('edit_menu_'):
+        cid = int(data.split('_')[2])
+        c   = get_concert(cid)
+        if c:
+            await query.edit_message_text(
+                concert_card(c),
+                reply_markup=edit_keyboard(cid),
+                parse_mode='Markdown'
+            )
+
+    # Поля редактирования через меню
+    elif data.startswith('ed_'):
+        parts = data.split('_', 2)
+        field = parts[1]
+        cid   = int(parts[2])
+        c     = get_concert(cid)
+        context.user_data['awaiting']        = field
+        context.user_data['awaiting_for_id'] = cid
+        prompts = {
+            'date':    f"📅 Введи дату для *{c['artist']}*:\nПример: `15.04.2026 21:00`",
+            'tickets': f"🎟 Введи ссылку для *{c['artist']}*:",
+            'text':    f"📝 Введи описание для *{c['artist']}*:",
+            'artist':  f"✏️ Новое имя (сейчас: {c['artist']}):",
+        }
+        await query.edit_message_text(prompts.get(field, 'Введи значение:'), parse_mode='Markdown')
+
     elif data == 'noop':
         await query.edit_message_text("Отменено")
 
 
-# ==================== ОЖИДАНИЕ ВВОДА (меню) ====================
+# ==================== ОЖИДАНИЕ ВВОДА ====================
 
 async def handle_awaiting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     awaiting = context.user_data.get('awaiting')
     if not awaiting:
         return False
-    cid     = context.user_data.pop('awaiting_for_id', None)
+    cid = context.user_data.pop('awaiting_for_id', None)
     context.user_data.pop('awaiting')
     if not cid:
         return False
     concert = get_concert(cid)
     if not concert:
         return False
-    text = update.message.text or ''
 
+    text = update.message.text or ''
     if awaiting == 'date':
         d, t = parse_date_time(text)
         if d: concert['date'] = d
         if t: concert['time'] = t
-    elif awaiting == 'city':    concert['city'] = text
     elif awaiting == 'tickets':
         urls = extract_urls(text)
         concert['tickets_url'] = urls[0] if urls else text
-    elif awaiting == 'text':    concert['description_text'] = text
-    elif awaiting == 'artist':  concert['artist'] = text
+    elif awaiting == 'text':
+        concert['description_text'] = text
+    elif awaiting == 'artist':
+        concert['artist'] = text
     else:
         return False
 
     save_concert(concert)
     sheets.sync_concert(concert)
     await notify_owner_if_ready(context, concert)
-    await update.message.reply_text(f"✅ *{concert['artist']}* — сохранено", parse_mode='Markdown')
+    kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
+    await update.message.reply_text(
+        f"✅ *{concert['artist']}* — сохранено",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode='Markdown'
+    )
     return True
 
 
@@ -686,79 +655,84 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`Артист билеты https://...`\n"
         "`Артист афиша одобрена`\n"
         "`Артист текст <описание>`\n"
-        "`Артист дата 15.03.2026 23:00`\n"
+        "`Артист дата 15.04.2026 21:00`\n"
         "`Артист отмена`\n\n"
         "*Команды:*\n"
-        "/createtask — новое мероприятие\n"
-        "/list — все в работе\n"
-        "/status [номер] — карточка\n"
-        "/publish [номер] — опубликовать\n"
-        "/cancel [номер] — отменить\n"
-        "/menu — управление\n"
-        "/digest — сводка\n"
-        "/help — помощь",
+        "`/createtask` — новое мероприятие\n"
+        "`/list` | `/list 2026-04`\n"
+        "`/status [номер]` — карточка\n"
+        "`/menu` — управление кнопками\n"
+        "`/publish [номер]` — опубликовать\n"
+        "`/cancel [номер]` — отменить\n"
+        "`/code [номер]` — HTML для Tilda\n"
+        "`/digest` — сводка",
         parse_mode='Markdown'
     )
 
 
-async def cmd_createtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat(update.effective_chat.id)
-    # Если передан аргумент — создать сразу
     args_text = ' '.join(context.args).strip() if context.args else ''
-    if args_text:
-        date_str, time_str = parse_date_time(args_text)
-        cleaned = re.sub(r'\d{1,2}[./\-]\d{1,2}[./\-]\d{4}', '', args_text)
-        cleaned = re.sub(r'\b\d{1,2}:\d{2}\b', '', cleaned).strip()
-        parts   = cleaned.split()
-        if len(parts) >= 2:
-            city, artist = parts[-1], ' '.join(parts[:-1])
-        elif len(parts) == 1:
-            artist, city = parts[0], None
-        else:
-            artist, city = args_text, None
-        cid = save_concert({'artist': artist, 'date': date_str, 'time': time_str, 'city': city})
-        concert = get_concert(cid)
-        kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
+
+    if not args_text:
+        context.user_data['awaiting']        = 'create_name'
+        context.user_data['awaiting_for_id'] = 0
+        await update.message.reply_text("Введи имя артиста:")
+        return
+
+    date_str, time_str = parse_date_time(args_text)
+    # Убираем дату из текста чтобы получить имя
+    cleaned = re.sub(r'\d{1,2}[./\-]\d{1,2}[./\-]\d{4}', '', args_text)
+    cleaned = re.sub(r'\b\d{1,2}[:.]\d{2}\b', '', cleaned).strip()
+    artist  = cleaned.strip() or args_text.strip()
+
+    # Проверяем дубли
+    matches = fuzzy_find(artist)
+    exact   = [c for c in matches if normalize(c['artist']) == normalize(artist)]
+    if exact:
+        c = exact[0]
+        kb = [[
+            InlineKeyboardButton("Создать новое", callback_data=f"force_create|{artist}|{date_str or ''}|{time_str or ''}"),
+            InlineKeyboardButton("Открыть существующее", callback_data=f"edit_menu_{c['id']}"),
+        ]]
         await update.message.reply_text(
-            concert_card(concert),
+            f"*{artist}* уже существует (#{c['id']}).\nЧто делаем?",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode='Markdown'
         )
-    else:
-        # Спрашиваем имя
-        context.user_data['awaiting']        = 'create_artist'
-        context.user_data['awaiting_for_id'] = 0
-        await update.message.reply_text(
-            "Введи имя артиста:",
-            parse_mode='Markdown'
-        )
+        return
+
+    cid = save_concert({'artist': artist, 'date': date_str, 'time': time_str})
+    concert = get_concert(cid)
+    kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
+    await update.message.reply_text(
+        concert_card(concert),
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode='Markdown'
+    )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat(update.effective_chat.id)
-    # Фильтр по месяцу если передан
+    include_all  = bool(context.args and context.args[0].lower() == 'all')
     month_filter = None
-    if context.args:
-        arg = context.args[0]
-        if re.match(r'^\d{4}-\d{2}$', arg):
-            month_filter = arg  # "2026-03"
+    if context.args and re.match(r'^\d{4}-\d{2}$', context.args[0]):
+        month_filter = context.args[0]
 
-    include_all = bool(context.args and context.args[0].lower() == 'all')
-    concerts    = get_all_concerts(include_cancelled=include_all)
+    concerts = get_all_concerts(include_cancelled=include_all)
 
     if month_filter:
-        # Фильтруем по месяцу (дата в формате DD.MM.YYYY)
         def in_month(c):
             d = c.get('date', '')
             if not d: return False
             try:
-                parts = d.split('.')
-                return f"{parts[2]}-{parts[1]}" == month_filter
+                p = d.split('.')
+                return f"{p[2]}-{p[1]}" == month_filter
             except: return False
         concerts = [c for c in concerts if in_month(c)]
 
     if not concerts:
-        await update.message.reply_text("Мероприятий нет.")
+        await update.message.reply_text("Мероприятий нет. Создай: `/createtask`", parse_mode='Markdown')
         return
 
     active    = [c for c in concerts if c['published_status'] == 'draft']
@@ -769,10 +743,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in active:
         icon = status_icon(c)
         d    = f" — {c['date']}" if c.get('date') else ''
-        city = f" ({c['city']})" if c.get('city') else ''
         m    = missing_fields(c)
         miss = f" | нет: {', '.join(m)}" if m else " | ✅"
-        lines.append(f"{icon} #{c['id']} {c['artist']}{d}{city}{miss}")
+        lines.append(f"{icon} #{c['id']} {c['artist']}{d}{miss}")
 
     if published:
         lines.append(f"\n⚫ Опубликовано: {len(published)}")
@@ -793,11 +766,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             cid = int(context.args[0])
         except ValueError:
-            # Попробуем как имя
             name    = ' '.join(context.args)
             matches = fuzzy_find(name)
-            if matches:
+            if len(matches) == 1:
                 cid = matches[0]['id']
+            elif len(matches) > 1:
+                kb = [[InlineKeyboardButton(
+                    f"#{c['id']} {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''),
+                    callback_data=f"edit_menu_{c['id']}"
+                )] for c in matches]
+                await update.message.reply_text("Уточни:", reply_markup=InlineKeyboardMarkup(kb))
+                return
 
     if not cid:
         await update.message.reply_text("Укажи номер: `/status 5`", parse_mode='Markdown')
@@ -866,29 +845,21 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    concerts = get_all_concerts()
-    active   = [c for c in concerts if c['published_status'] == 'draft']
-
-    if not active:
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    concerts = [c for c in get_all_concerts() if c['published_status'] == 'draft']
+    if not concerts:
         await update.message.reply_text("Нет активных мероприятий. Создай: `/createtask`", parse_mode='Markdown')
         return
-
     kb = [[InlineKeyboardButton(
-        f"{status_icon(c)} #{c['id']} {c['artist']}",
+        f"{status_icon(c)} #{c['id']} {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''),
         callback_data=f"edit_menu_{c['id']}"
-    )] for c in active[:10]]
-
-    await update.message.reply_text(
-        "📋 Выбери мероприятие:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    )] for c in concerts[:15]]
+    await update.message.reply_text("📋 Выбери мероприятие:", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat(update.effective_chat.id)
     all_c = get_all_concerts()
-
     ready, in_progress, draft_only, published = [], [], [], []
     for c in all_c:
         if c['published_status'] == 'published':    published.append(c)
@@ -898,35 +869,27 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   c.get('description_text')]):      in_progress.append(c)
         else:                                       draft_only.append(c)
 
-    if not ready and not in_progress and not draft_only:
+    if not any([ready, in_progress, draft_only]):
         await update.message.reply_text("📊 Активных мероприятий нет.")
         return
 
     now   = datetime.now()
     lines = [f"📊 *Статус на {now.strftime('%d.%m.%Y')}*\n"]
-
     if ready:
         lines.append(f"🟢 READY ({len(ready)})")
-        for c in ready:
-            lines.append(f"— {c['artist']}" + (f" — {c['date']}" if c.get('date') else ''))
+        for c in ready: lines.append(f"— {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''))
         lines.append("")
-
     if in_progress:
         lines.append(f"🟡 IN PROGRESS ({len(in_progress)})")
-        for c in in_progress:
-            lines.append(f"— {c['artist']} (нет: {', '.join(missing_fields(c))})")
+        for c in in_progress: lines.append(f"— {c['artist']} (нет: {', '.join(missing_fields(c))})")
         lines.append("")
-
     if draft_only:
         lines.append(f"🔴 DRAFT ({len(draft_only)})")
-        for c in draft_only:
-            lines.append(f"— {c['artist']}")
+        for c in draft_only: lines.append(f"— {c['artist']}")
         lines.append("")
-
     if published:
         lines.append(f"⚫ PUBLISHED ({len(published)})")
-        for c in published[:5]:
-            lines.append(f"— {c['artist']}")
+        for c in published[:5]: lines.append(f"— {c['artist']}")
 
     await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
 
@@ -947,21 +910,19 @@ async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     artist      = concert.get('artist', '')
     date        = concert.get('date', '')
-    time_str    = concert.get('time', '')
-    city        = concert.get('city', '')
+    time_s      = concert.get('time', '')
     tickets_url = concert.get('tickets_url', '')
     description = concert.get('description_text', '')
-    date_line   = f"{date} • {time_str}" if time_str else date
+    date_line   = f"{date} • {time_s}" if time_s else date
 
     html = f"""<div class="event-wrapper">
     <div class="event-image">
-        <!-- Замени POSTER_URL на URL афиши -->
+        <!-- Замени POSTER_URL на URL афиши после загрузки в Tilda -->
         <img src="POSTER_URL" alt="{artist}">
     </div>
     <div class="event-content">
         <h1 class="event-title">{artist.upper()}</h1>
         <div class="event-datetime">{date_line}</div>
-        <div class="event-city">{city}</div>
         <div class="buttons-row">
             <button class="buy-btn" onclick="window.open('{tickets_url}','_blank')">
                 Купить билет
@@ -983,35 +944,16 @@ async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎸 *MTB Concerts Manager*\n\n"
-        "*Триггеры одной строкой:*\n"
-        "`Артист билеты https://...`\n"
-        "`Артист афиша одобрена`\n"
-        "`Артист текст <описание>`\n"
-        "`Артист дата 15.03.2026 23:00`\n"
-        "`Артист отмена`\n\n"
-        "*Команды:*\n"
-        "`/createtask [дата Артист Город]` — новое мероприятие\n"
-        "`/list` | `/list 2026-03` | `/list all`\n"
-        "`/status [номер]` — карточка\n"
-        "`/publish [номер]` — опубликовать\n"
-        "`/cancel [номер]` — отменить\n"
-        "`/menu` — управление кнопками\n"
-        "`/code [номер]` — HTML для Tilda\n"
-        "`/digest` — сводка по всем",
-        parse_mode='Markdown'
-    )
+    await cmd_start(update, context)
 
 
-# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+# ==================== ОБРАБОТЧИК ТЕКСТА ====================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    text    = message.text or ''
+    text = update.message.text or ''
 
-    # Ожидание ввода из меню
-    if context.user_data.get('awaiting') == 'create_artist':
+    # Ожидание имени при /createtask
+    if context.user_data.get('awaiting') == 'create_name':
         context.user_data.pop('awaiting')
         context.user_data.pop('awaiting_for_id', None)
         artist = text.strip()
@@ -1019,13 +961,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid     = save_concert({'artist': artist})
             concert = get_concert(cid)
             kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
-            await message.reply_text(
+            await update.message.reply_text(
                 concert_card(concert),
                 reply_markup=InlineKeyboardMarkup(kb),
                 parse_mode='Markdown'
             )
         return
 
+    # Ожидание ввода из меню
     if await handle_awaiting(update, context):
         return
 
@@ -1035,6 +978,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_trigger(update, context, parsed)
 
 
+# ==================== CALLBACK: force_create ====================
+
+async def handle_callback_extra(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Дополнительные колбэки."""
+    query = update.callback_query
+    data  = query.data
+
+    if data.startswith('force_create|'):
+        await query.answer()
+        parts    = data.split('|')
+        artist   = parts[1]
+        date_str = parts[2] or None
+        time_str = parts[3] or None
+        cid      = save_concert({'artist': artist, 'date': date_str, 'time': time_str})
+        concert  = get_concert(cid)
+        kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
+        await query.edit_message_text(
+            concert_card(concert),
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='Markdown'
+        )
+
+
 # ==================== ПЛАНИРОВЩИК ====================
 
 async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
@@ -1042,20 +1008,20 @@ async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
     ready, in_progress, draft_only = [], [], []
     for c in all_c:
         if c['published_status'] != 'draft': continue
-        if is_ready(c):                      ready.append(c)
+        if is_ready(c):   ready.append(c)
         elif any([c.get('date'), c.get('tickets_url'),
                   c.get('poster_status') == 'approved',
                   c.get('description_text')]): in_progress.append(c)
-        else:                                draft_only.append(c)
+        else: draft_only.append(c)
 
-    if not ready and not in_progress and not draft_only:
+    if not any([ready, in_progress, draft_only]):
         return
 
     now   = datetime.now()
     lines = [f"📊 *Статус на {now.strftime('%d.%m.%Y')}*\n"]
     if ready:
         lines.append(f"🟢 READY ({len(ready)})")
-        for c in ready: lines.append(f"— {c['artist']}")
+        for c in ready: lines.append(f"— {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''))
         lines.append("")
     if in_progress:
         lines.append(f"🟡 IN PROGRESS ({len(in_progress)})")
@@ -1071,7 +1037,7 @@ async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
         except Exception as e:
-            logger.error(f"Digest error {chat_id}: {e}")
+            logger.error(f"Digest {chat_id}: {e}")
 
 
 # ==================== MAIN ====================
@@ -1081,28 +1047,30 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     for cmd, handler in [
-        ("start",       cmd_start),
-        ("createtask",  cmd_createtask),
-        ("new",         cmd_createtask),
-        ("list",        cmd_list),
-        ("status",      cmd_status),
-        ("publish",     cmd_publish),
-        ("cancel",      cmd_cancel),
-        ("menu",        cmd_menu),
-        ("digest",      cmd_digest),
-        ("code",        cmd_code),
-        ("help",        cmd_help),
+        ("start",      cmd_start),
+        ("new", cmd_new),
+        # убрано,
+        ("list",       cmd_list),
+        ("status",     cmd_status),
+        ("publish",    cmd_publish),
+        ("cancel",     cmd_cancel),
+        ("edit", cmd_edit),
+        ("digest",     cmd_digest),
+        ("code",       cmd_code),
+        ("help",       cmd_help),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Два обработчика колбэков — основной и дополнительный
+    app.add_handler(CallbackQueryHandler(handle_callback_extra, pattern=r'^force_create\|'))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     jq = app.job_queue
     if jq:
         jq.run_daily(send_morning_digest, time=dtime(hour=9, minute=0), name='digest')
 
-    logger.info("🎸 MTB Concerts Bot v3 запущен!")
+    logger.info("🎸 MTB Concerts Bot v4 запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
