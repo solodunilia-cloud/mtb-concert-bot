@@ -290,48 +290,115 @@ def fuzzy_find(name: str, include_cancelled=False) -> List[Dict]:
 
 # ==================== ПАРСИНГ ТРИГГЕРА ====================
 
+def detect_action(text: str) -> Optional[str]:
+    """Определяет тип действия через fuzzy matching по ключевым словам."""
+    from rapidfuzz import fuzz as rfuzz
+    norm = normalize(text)
+    keywords = {
+        'tickets': T_TICKETS,
+        'poster':  T_POSTER,
+        'text':    T_TEXT,
+        'date':    T_DATE,
+        'cancel':  T_CANCEL,
+    }
+    for action, words in keywords.items():
+        for word in words:
+            # Точное вхождение нормализованного слова
+            if normalize(word) in norm.split():
+                return action
+            # Fuzzy — для опечаток типа "билеты" -> "балеты"
+            for w in norm.split():
+                if rfuzz.ratio(normalize(word), w) >= 85:
+                    return action
+    return None
+
+
+def extract_artist_name(text: str, action_word: str) -> str:
+    """Убирает из текста URL, триггерное слово и возвращает остаток как имя артиста."""
+    # Убираем URL
+    cleaned = re.sub(r'https?://\S+', '', text)
+    # Убираем все ключевые слова триггеров
+    all_kw = T_TICKETS + T_POSTER + T_TEXT + T_DATE + T_CANCEL + T_POSTER_OK
+    for kw in all_kw:
+        cleaned = re.sub(r'(?i)' + re.escape(kw) + r'', '', cleaned)
+    # Убираем даты
+    cleaned = re.sub(r'\d{1,2}[./\-]\d{1,2}[./\-]\d{4}', '', cleaned)
+    cleaned = re.sub(r'\d{1,2}[:.:]\d{2}', '', cleaned)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
 def parse_trigger(text: str) -> Optional[Dict]:
     """
-    Ищет триггерное слово в тексте.
-    Возвращает {artist_name, trigger_type, payload} или None.
-
-    Форматы:
+    Работает с любым порядком слов:
       Иван Дорн билеты https://...
+      билеты Иван Дорн https://...
+      https://... Иван Дорн билеты
       Иван Дорн афиша одобрена
-      Иван Дорн текст Описание концерта...
+      Иван Дорн текст Описание...
       Иван Дорн дата 15.04.2026 21:00
       Иван Дорн отмена
     """
     text = text.strip()
-    if not text:
+    if not text or len(text.split()) < 2:
         return None
 
-    words = text.split()
-    if len(words) < 2:
+    # 1. Определяем действие
+    trigger_type = detect_action(text)
+    if not trigger_type:
         return None
 
-    all_triggers = {
-        **{normalize(w): 'tickets' for w in T_TICKETS},
-        **{normalize(w): 'poster'  for w in T_POSTER},
-        **{normalize(w): 'text'    for w in T_TEXT},
-        **{normalize(w): 'date'    for w in T_DATE},
-        **{normalize(w): 'cancel'  for w in T_CANCEL},
+    # 2. Извлекаем URL если есть
+    urls    = extract_urls(text)
+    payload = urls[0] if urls else ''
+
+    # 3. Для текста — payload это всё что не артист и не триггер
+    # Для даты — payload это дата
+    if trigger_type == 'text':
+        # Убираем триггерное слово, остаток = артист + текст
+        # Артист = первые слова до триггерного слова (или первые 2-3 слова)
+        norm_text = normalize(text)
+        # Ищем позицию триггерного слова
+        for kw in T_TEXT:
+            pos = norm_text.find(normalize(kw))
+            if pos != -1:
+                before = text[:pos].strip()
+                after  = text[pos + len(kw):].strip()
+                artist = before if before else after[:30]
+                payload = after if before else ''
+                return {'artist_name': artist.strip(), 'trigger_type': trigger_type, 'payload': payload.strip()}
+
+    if trigger_type == 'date':
+        for kw in T_DATE:
+            norm_text = normalize(text)
+            pos = norm_text.find(normalize(kw))
+            if pos != -1:
+                before = text[:pos].strip()
+                after  = text[pos + len(kw):].strip()
+                artist = before if before else extract_artist_name(text, kw)
+                payload = after
+                return {'artist_name': artist.strip(), 'trigger_type': trigger_type, 'payload': payload.strip()}
+
+    if trigger_type == 'poster':
+        for kw in T_POSTER:
+            norm_text = normalize(text)
+            pos = norm_text.find(normalize(kw))
+            if pos != -1:
+                before = text[:pos].strip()
+                after  = text[pos + len(kw):].strip()
+                artist = before if before else extract_artist_name(text, kw)
+                payload = after
+                return {'artist_name': artist.strip(), 'trigger_type': trigger_type, 'payload': payload.strip()}
+
+    # 4. Для остальных — имя артиста это всё кроме URL и ключевых слов
+    artist_name = extract_artist_name(text, '')
+    if not artist_name:
+        return None
+
+    return {
+        'artist_name':  artist_name,
+        'trigger_type': trigger_type,
+        'payload':      payload,
     }
-
-    # Ищем первое триггерное слово начиная со второго слова
-    for i in range(1, len(words)):
-        w = normalize(words[i])
-        if w in all_triggers:
-            artist_name = ' '.join(words[:i]).strip()
-            trigger_type = all_triggers[w]
-            payload = ' '.join(words[i+1:]).strip()
-            if artist_name:
-                return {
-                    'artist_name':  artist_name,
-                    'trigger_type': trigger_type,
-                    'payload':      payload,
-                }
-    return None
 
 # ==================== ОБРАБОТКА ТРИГГЕРА ====================
 
