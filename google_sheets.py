@@ -118,7 +118,9 @@ class GoogleSheetsManager:
             self.spreadsheet = self.client.open_by_key(spreadsheet_id)
             logger.info("✅ Google Sheets подключён")
         except Exception as e:
+            import traceback
             logger.error(f"Google Sheets init error: {e}")
+            logger.error(traceback.format_exc())
 
     def _is_connected(self) -> bool:
         return self.client is not None and self.spreadsheet is not None
