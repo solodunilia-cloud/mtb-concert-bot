@@ -173,11 +173,20 @@ def extract_date_time(text: str) -> Tuple[Optional[str], Optional[str]]:
             y = str(datetime.now().year)
             date_str = f"{int(d):02d}.{int(mo):02d}.{y}"
 
-    # Время HH:MM или HH.MM
-    m = re.search(r'\b(\d{1,2})[:\.](\d{2})\b', text)
+    # Время HH:MM или HH.MM — ищем ТОЛЬКО после удаления всех дат из текста
+    # чтобы "15.04.2026" не давало время "15:04"
+    text_no_date = re.sub(r'\d{1,2}[./\-]\d{1,2}[./\-]\d{4}', '', text)
+    text_no_date = re.sub(r'\b\d{1,2}[./]\d{1,2}\b', '', text_no_date)
+    for mo in MONTHS:
+        text_no_date = re.sub(r'(?i)\b' + mo + r'\b', '', text_no_date)
+    # Ищем время только в очищенном тексте, и только HH:MM (двоеточие) или HH.MM
+    m = re.search(r'\b(\d{1,2}):(\d{2})\b', text_no_date)
+    if not m:
+        # Точка — только если это явно время (не часть числа/даты)
+        m = re.search(r'(?<!\d)(\d{1,2})\.(\d{2})(?!\d)', text_no_date)
     if m:
         h, mi = m.groups()
-        if 0 <= int(h) <= 23:
+        if 0 <= int(h) <= 23 and 0 <= int(mi) <= 59:
             time_str = f"{int(h):02d}:{int(mi):02d}"
 
     return date_str, time_str
@@ -264,18 +273,18 @@ _notify_enabled: bool = True
 
 def edit_kb(cid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Дата",        callback_data=f"ed|date|{cid}"),
-         InlineKeyboardButton("🖼 Афиша ✓",     callback_data=f"do|poster|{cid}")],
-        [InlineKeyboardButton("🎟 Билеты",      callback_data=f"ed|tickets|{cid}"),
-         InlineKeyboardButton("📝 Текст",       callback_data=f"ed|text|{cid}")],
-        [InlineKeyboardButton("🗑 Сброс даты",  callback_data=f"clr|date|{cid}"),
-         InlineKeyboardButton("🗑 Сброс афиши", callback_data=f"clr|poster|{cid}")],
+        [InlineKeyboardButton("🗑 Сброс даты",    callback_data=f"clr|date|{cid}"),
+         InlineKeyboardButton("📅 Дата",           callback_data=f"ed|date|{cid}")],
+        [InlineKeyboardButton("🗑 Сброс афиши",   callback_data=f"clr|poster|{cid}"),
+         InlineKeyboardButton("🖼 Афиша ✓",        callback_data=f"do|poster|{cid}")],
         [InlineKeyboardButton("🗑 Сброс билетов", callback_data=f"clr|tickets|{cid}"),
-         InlineKeyboardButton("🗑 Сброс текста",  callback_data=f"clr|text|{cid}")],
-        [InlineKeyboardButton("✏️ Артист",      callback_data=f"ed|artist|{cid}"),
-         InlineKeyboardButton("🚫 Отменить",    callback_data=f"do|cancel|{cid}")],
-        [InlineKeyboardButton("⚫ Опубликовать", callback_data=f"do|publish|{cid}"),
-         InlineKeyboardButton("🗑 Удалить",     callback_data=f"do|delete|{cid}")],
+         InlineKeyboardButton("🎟 Билеты",         callback_data=f"ed|tickets|{cid}")],
+        [InlineKeyboardButton("🗑 Сброс текста",  callback_data=f"clr|text|{cid}"),
+         InlineKeyboardButton("📝 Текст",          callback_data=f"ed|text|{cid}")],
+        [InlineKeyboardButton("🚫 Отменить",       callback_data=f"do|cancel|{cid}"),
+         InlineKeyboardButton("✏️ Артист",         callback_data=f"ed|artist|{cid}")],
+        [InlineKeyboardButton("🗑 Удалить",        callback_data=f"do|delete|{cid}"),
+         InlineKeyboardButton("⚫ Опубликовать",    callback_data=f"do|publish|{cid}")],
     ])
 
 async def notify_ready(ctx: ContextTypes.DEFAULT_TYPE, c: dict):
@@ -633,8 +642,12 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith('edit_menu_'):
+        cid = int(data.replace('edit_menu_', ''))
+        c   = db_get(cid)
         if c:
             await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
+        else:
+            await q.edit_message_text("Мероприятие не найдено")
         return
 
     if data.startswith('ed|'):
@@ -931,7 +944,14 @@ async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         lines = [f"❌ *Нет {label}: {len(concerts)}*\n"]
         for c in concerts:
-            d = f" — {c['date']}" if c.get('date') else ''
+            date_part = c.get('date', '')
+            time_part = c.get('time', '')
+            if date_part and time_part:
+                d = f" — {date_part} {time_part}"
+            elif date_part:
+                d = f" — {date_part}"
+            else:
+                d = ''
             lines.append(f"#{c['id']} *{c['artist']}*{d}")
         await upd.message.reply_text('\n'.join(lines), parse_mode='Markdown')
         return
@@ -958,7 +978,14 @@ async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📋 *В работе: {len(active)}*\n"]
     for c in active:
-        d    = f" — {c['date']}" if c.get('date') else ''
+        date_part = c.get('date', '')
+        time_part = c.get('time', '')
+        if date_part and time_part:
+            d = f" — {date_part} {time_part}"
+        elif date_part:
+            d = f" — {date_part}"
+        else:
+            d = ''
         m    = missing(c)
         miss = f" | нет: {', '.join(m)}" if m else " | ✅"
         lines.append(f"{s_icon(c)} #{c['id']} *{c['artist']}*{d}{miss}")
@@ -1391,6 +1418,47 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
 
 
+async def cmd_rebuild(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Пересобирает все календари и чистит имена артистов в Sheets."""
+    global _concerts
+    msg = await upd.message.reply_text("🔄 Пересобираю календари...")
+
+    # Чистим имена артистов в памяти (убираем " —" и лишние пробелы)
+    for c in _concerts:
+        c['artist'] = c['artist'].rstrip(' —').strip()
+
+    # Пересобираем все месяцы
+    months = set()
+    for c in _concerts:
+        if c.get('date'):
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.strptime(c['date'], '%d.%m.%Y')
+                months.add((dt.month, dt.year))
+            except Exception:
+                pass
+
+    count = 0
+    for month, year in sorted(months):
+        try:
+            sheets.rebuild_month_calendar(month, year, _concerts)
+            count += 1
+        except Exception as e:
+            logger.error(f"rebuild {month}/{year}: {e}")
+
+    # Синхронизируем все концерты в лист Данные (с чистыми именами)
+    for c in _concerts:
+        try:
+            sheets._sync_data_row(c)
+        except Exception as e:
+            logger.error(f"sync row {c['id']}: {e}")
+
+    await msg.edit_text(
+        f"✅ Готово!\n"
+        f"Пересобрано календарей: {count}\n"
+        f"Концертов обновлено: {len(_concerts)}"
+    )
+
 async def cmd_notify_on(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global _notify_enabled
     _notify_enabled = True
@@ -1491,6 +1559,7 @@ def main():
         ('help',       cmd_start),
         ('notify_on',  cmd_notify_on),
         ('notify_off', cmd_notify_off),
+        ('rebuild',    cmd_rebuild),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
