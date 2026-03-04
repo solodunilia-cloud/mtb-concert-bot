@@ -366,15 +366,15 @@ class GoogleSheetsManager:
                 if day == 0:
                     pass  # оставляем пустые строки
                 else:
-                    row_days.append(str(day))
+                    row_days[day_idx] = str(day)
                     day_cs = concerts_by_day.get(day, [])
                     info   = ['', '', '']
                     for i, c in enumerate(day_cs[:3]):
                         t = f" {c['time']}" if c.get('time') else ''
                         info[i] = f"{c.get('artist','')}{t}\n{_status_text(c)}"
-                    row_info1.append(info[0])
-                    row_info2.append(info[1])
-                    row_info3.append(info[2])
+                    row_info1[day_idx] = info[0]
+                    row_info2[day_idx] = info[1]
+                    row_info3[day_idx] = info[2]
 
             r = current_row
             batch += [
@@ -535,7 +535,7 @@ class GoogleSheetsManager:
                     continue
                 concerts.append({
                     'id':               int(cid),
-                    'artist':           row[4].strip(),
+                    'artist':           row[4].strip().rstrip(' —').strip(),
                     'date':             row[1].strip() or None,
                     'time':             row[2].strip() or None,
                     'poster_status':    'approved' if row[8].strip() == '✅' else 'none',
