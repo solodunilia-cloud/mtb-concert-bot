@@ -128,6 +128,31 @@ def norm(text: str) -> str:
     text = re.sub(r'[^\w\s]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
+def transliterate(text: str) -> str:
+    """ИВАН ДОРН → ivan-dorn"""
+    table = {
+        'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e',
+        'ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m',
+        'н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u',
+        'ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'sch',
+        'ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    }
+    result = ''
+    for ch in text.lower():
+        if ch in table:
+            result += table[ch]
+        elif ch.isascii() and (ch.isalnum() or ch == ' '):
+            result += ch
+    result = re.sub(r'\s+', '-', result.strip())
+    return re.sub(r'-+', '-', result)
+
+def make_slug(artist: str, date_str: str = '') -> str:
+    """Иван Дорн + 15.04.2026 → ivan-dorn-15-04-2026"""
+    slug = transliterate(artist)
+    if date_str:
+        slug += '-' + date_str.replace('.', '-')
+    return slug.lower()
+
 def extract_url(text: str) -> Optional[str]:
     m = re.search(r'https?://\S+', text)
     return m.group(0) if m else None
@@ -1199,6 +1224,22 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bio     = io.BytesIO(full_code.encode('utf-8'))
     bio.name = fname
     await upd.message.reply_document(document=bio, filename=fname)
+
+    # Второе сообщение — SEO данные для Tilda
+    slug      = make_slug(artist, date_str)
+    seo_title = f"{artist} — праздничный концерт в Мумий Тролль Бар, Москва"
+    seo_desc  = (
+        f"Билеты на концерт {artist} в Мумий Тролль Бар, "
+        f"музыкальный бар, ресторан с живой музыкой, "
+        f"концертная площадка, Мумий Тролль Бар"
+    )
+    seo_msg = (
+        f"📋 *SEO для страницы*\n\n"
+        f"*Адрес страницы (slug):*\n`{slug}`\n\n"
+        f"*SEO заголовок:*\n`{seo_title}`\n\n"
+        f"*SEO описание:*\n`{seo_desc}`"
+    )
+    await upd.message.reply_text(seo_msg, parse_mode='Markdown')
 
 
 # ─── ОБРАБОТЧИК ТЕКСТА ────────────────────────────────────────────────────────
