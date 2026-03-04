@@ -117,9 +117,16 @@ def get_chats() -> List[int]:
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ──────────────────────────────────────────────────
 
+# Латиница → кириллица для часто путаемых символов
+_CYR_LAT = str.maketrans('aceopxyABCEHKMOPTX', 'асеорхуАВСЕНКМОРТХ')
+
 def norm(text: str) -> str:
-    text = text.lower().replace('ё', 'е')
-    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text)).strip()
+    """Нормализация с заменой латиницы на кириллицу."""
+    text = text.lower()
+    text = text.translate(_CYR_LAT)
+    text = text.replace('ё', 'е')
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
 
 def extract_url(text: str) -> Optional[str]:
     m = re.search(r'https?://\S+', text)
@@ -173,19 +180,29 @@ def strip_date_time(text: str) -> str:
         cleaned = re.sub(r'(?i)\b' + mo + r'\b', '', cleaned)
     return re.sub(r'\s+', ' ', cleaned).strip()
 
-def fuzzy_find(name: str) -> List[dict]:
+def fuzzy_find(name: str, soft=False) -> List[dict]:
+    """
+    soft=True — возвращает также совпадения 60-69 (для "ты имел в виду?")
+    """
     all_c  = db_all()
     name_n = norm(name)
     results = []
     for c in all_c:
-        score = fuzz.token_set_ratio(name_n, norm(c['artist']))
-        if score >= 70:
+        c_n   = norm(c['artist'])
+        score = max(
+            fuzz.token_set_ratio(name_n, c_n),
+            fuzz.partial_ratio(name_n, c_n),
+            fuzz.WRatio(name_n, c_n),
+        )
+        threshold = 60 if soft else 65
+        if score >= threshold:
             results.append((c, score))
     if not results:
         return []
     results.sort(key=lambda x: x[1], reverse=True)
     top = results[0][1]
-    if top == 100 or (len(results) >= 2 and top - results[1][1] >= 20):
+    # Одно явное совпадение
+    if top >= 90 or (len(results) >= 2 and top - results[1][1] >= 20):
         return [results[0][0]]
     return [r[0] for r in results[:5]]
 
@@ -258,15 +275,30 @@ async def notify_ready(ctx: ContextTypes.DEFAULT_TYPE, c: dict):
 def detect_kw(text: str) -> Optional[Tuple[str, str]]:
     text_n = norm(text)
     words  = text_n.split()
+
     for action, keywords in KW.items():
         for kw in keywords:
             kw_n = norm(kw)
-            if kw_n in words:
+
+            # 1. Прямое вхождение подстроки (ловит "билеты!" "билеты,")
+            if kw_n in text_n:
                 return action, kw
+
+            # 2. Fuzzy по каждому слову (ловит "билетсы", "тикетс")
             for w in words:
-                if len(w) >= 4 and fuzz.ratio(kw_n, w) >= 85:
+                if len(w) >= 4 and fuzz.partial_ratio(kw_n, w) >= 80:
                     return action, w
+
+            # 3. Fuzzy по всей строке (ловит опечатки в разных позициях)
+            if fuzz.partial_ratio(kw_n, text_n) >= 85:
+                return action, kw
+
     return None
+
+STOP_WORDS = [
+    'пожалуйста', 'плиз', 'please', 'брат', 'срочно', 'давай',
+    'поставь', 'добавь', 'обнови', 'вот', 'держи', 'смотри',
+]
 
 def parse_trigger(text: str) -> Optional[dict]:
     """Любой порядок: Артист билеты URL / билеты Артист URL / и т.д."""
@@ -284,11 +316,21 @@ def parse_trigger(text: str) -> Optional[dict]:
     for kw in all_kw:
         cleaned = re.sub(r'(?i)\b' + re.escape(kw) + r'\b', '', cleaned)
     cleaned = strip_date_time(cleaned)
-    artist  = re.sub(r'\s+', ' ', cleaned).strip()
+
+    # Убираем стоп-слова (мусор)
+    for sw in STOP_WORDS:
+        cleaned = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', cleaned)
+
+    artist = re.sub(r'\s+', ' ', cleaned).strip()
 
     if not artist or len(artist) < 2:
         return None
 
+    # Защита от мусора — слишком длинное "имя артиста"
+    if len(artist.split()) > 6:
+        return None
+
+    # URL всегда берём из исходного текста
     url     = extract_url(text)
     payload = url or ''
 
@@ -546,6 +588,23 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cid    = db_save({'artist': artist, 'date': d, 'time': t})
         c      = db_get(cid)
         await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
+
+    if data.startswith('upd_date|'):
+        # Обновить дату существующего артиста из свободного ввода
+        parts = data.split('|')
+        cid   = int(parts[1])
+        d     = parts[2] or None
+        t     = parts[3] or None
+        c     = db_get(cid)
+        if c and d:
+            c['date'] = d
+            if t: c['time'] = t
+            db_save(c); sheets.sync_concert(c)
+            await notify_ready(ctx, c)
+            await q.edit_message_text(
+                f"✅ Дата *{c['artist']}* обновлена: `{d} {t or ''}`.strip()",
+                parse_mode='Markdown'
+            )
 
 # ─── ОЖИДАНИЕ ВВОДА ───────────────────────────────────────────────────────────
 
@@ -1031,22 +1090,57 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await process_trigger(upd, ctx, parsed)
         return
 
-    # Свободный ввод: Имя + дата → предложить создать
+    # Свободный ввод: Имя + дата → предложить создать или обновить дату
     free = parse_free_text(text)
     if free:
         artist  = free['artist']
         d, t    = free['date'], free['time']
         matches = fuzzy_find(artist)
-        if not matches:
+        if matches:
+            # Артист найден → предложить обновить дату существующего
+            c  = matches[0]
+            dt = f"{d} {t or ''}".strip()
+            kb = [[
+                InlineKeyboardButton(f"📅 Обновить дату #{c['id']}", callback_data=f"upd_date|{c['id']}|{d}|{t or ''}"),
+                InlineKeyboardButton("➕ Создать новое",              callback_data=f"new_confirm|{artist}|{d or ''}|{t or ''}"),
+                InlineKeyboardButton("❌ Отмена",                     callback_data="noop"),
+            ]]
+            await upd.message.reply_text(
+                f"Найден *#{c['id']} {c['artist']}*.\n"
+                f"Обновить дату на `{dt}` или создать новое мероприятие?",
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+            )
+        else:
+            # Артист не найден → предложить создать
+            dt = f"{d} {t or ''}".strip()
             kb = [[
                 InlineKeyboardButton("✅ Создать", callback_data=f"new_confirm|{artist}|{d or ''}|{t or ''}"),
                 InlineKeyboardButton("❌ Отмена",  callback_data="noop"),
             ]]
-            dt = f"{d} {t or ''}".strip()
             await upd.message.reply_text(
                 f"Создать мероприятие *{artist}* на `{dt}`?",
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
             )
+        return
+
+    # "Ты имел в виду?" — мягкий fuzzy (60-65) без триггера
+    if len(text.split()) <= 5:
+        soft = fuzzy_find(text, soft=True)
+        strict = fuzzy_find(text)
+        if soft and not strict:
+            c  = soft[0]
+            cn = norm(c['artist'])
+            tn = norm(text)
+            score = max(fuzz.token_set_ratio(tn, cn), fuzz.partial_ratio(tn, cn))
+            if 60 <= score < 65:
+                kb = [[
+                    InlineKeyboardButton(f"✅ Да, #{c['id']} {c['artist']}", callback_data=f"edit_menu_{c['id']}"),
+                    InlineKeyboardButton("❌ Нет", callback_data="noop"),
+                ]]
+                await upd.message.reply_text(
+                    f"Ты имел в виду *{c['artist']}*?",
+                    reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+                )
 
 
 # ─── УТРЕННИЙ ДАЙДЖЕСТ ────────────────────────────────────────────────────────
