@@ -1011,43 +1011,177 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     first_para = paragraphs[0] if paragraphs else desc
     rest_paras = '<br><br>'.join(paragraphs[1:]) if len(paragraphs) > 1 else ''
 
-    html_lines = [
-        '<div class="event-wrapper">',
-        '    <button class="back-btn" onclick="goBackSafe(); return false;">',
-        '        <span class="arrow-left">←</span>',
-        '        <span>Назад</span>',
-        '    </button>',
-        '    <div class="event-image">',
-        f'        <img src="{poster_url}" alt="{artist}">',
-        '    </div>',
-        '    <div class="event-content">',
-        f'        <h1 class="event-title">{artist.upper()}</h1>',
-        f'        <div class="event-datetime">{dt}</div>',
-        '        <div class="buttons-row">',
-        f'            <button class="buy-btn" onclick="window.open(\'{url}\', \'_blank\')">',
-        '                Купить билет',
-        '            </button>',
-        '        </div>',
-        '        <div class="text-container" id="textContainer">',
-        '            <div class="text-scroll-zone" id="textZone">',
-        f'                <p class="text-preview">{first_para}</p>',
-        f'                <p class="full-text">{rest_paras}</p>',
-        '            </div>',
-        '            <div class="toggle-btn-wrapper" id="toggleWrapper" style="display: none;">',
-        '                <button class="toggle-btn" onclick="toggleText()">',
-        '                    <span class="btn-text">Читать далее</span>',
-        '                    <span class="arrow">▼</span>',
-        '                </button>',
-        '            </div>',
-        '        </div>',
-        '    </div>',
-        '</div>',
-    ]
-    html = '\n'.join(html_lines)
+    # Полный шаблон — HTML + CSS + JS
+    full_code = f"""<div class="event-wrapper">
+    <button class="back-btn" onclick="goBackSafe(); return false;">
+        <span class="arrow-left">←</span>
+        <span>Назад</span>
+    </button>
+
+    <div class="event-image">
+        <img src="{poster_url}" alt="{artist}">
+    </div>
+
+    <div class="event-content">
+        <h1 class="event-title">{artist.upper()}</h1>
+        <div class="event-datetime">{dt}</div>
+
+        <div class="buttons-row">
+            <button class="buy-btn" onclick="window.open('{url}', '_blank')">
+                Купить билет
+            </button>
+        </div>
+
+        <div class="text-container" id="textContainer">
+            <div class="text-scroll-zone" id="textZone">
+                <p class="text-preview">
+                    {first_para}
+                </p>
+                <p class="full-text">
+                    {rest_paras}
+                </p>
+            </div>
+
+            <div class="toggle-btn-wrapper" id="toggleWrapper" style="display: none;">
+                <button class="toggle-btn" onclick="toggleText()">
+                    <span class="btn-text">Читать далее</span>
+                    <span class="arrow">▼</span>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ background: #070707; color: #fff; font-family: 'Winston', sans-serif; font-weight: 400; overflow-x: hidden; }}
+
+    .event-wrapper {{
+        max-width: 1200px; margin: 0 auto; display: flex; gap: 40px;
+        padding: 80px 20px 40px; position: relative; align-items: flex-start;
+    }}
+
+    .back-btn {{
+        position: absolute; top: 25px; left: 20px;
+        background: transparent; border: none; color: #fff;
+        font-size: 14px; font-weight: 500; cursor: pointer;
+        display: inline-flex; align-items: center; gap: 8px; z-index: 10;
+    }}
+
+    .event-image {{
+        flex: 0 0 450px; width: 450px; aspect-ratio: 1 / 1 !important;
+        overflow: hidden; background: #111;
+    }}
+    .event-image img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+
+    .event-content {{ flex: 1; min-width: 0; display: flex; flex-direction: column; align-self: stretch; }}
+
+    .event-title {{ font-size: 38px; letter-spacing: 2px; line-height: 1.1; text-transform: uppercase; font-weight: 400 !important; margin-bottom: 10px; }}
+    .event-datetime {{ font-size: 18px; color: #f5ce3e; margin-bottom: 25px; }}
+    .buttons-row {{ display: flex; gap: 15px; margin-bottom: 25px; }}
+
+    .buy-btn {{
+        padding: 14px 30px; font-size: 15px; font-family: 'Winston', sans-serif; font-weight: 600;
+        border-radius: 30px; cursor: pointer; transition: 0.3s; border: none;
+        background: #f5ce3e; color: #000 !important;
+    }}
+
+    .text-container {{ flex: 1; display: flex; flex-direction: column; min-height: 0; }}
+    .text-preview, .full-text {{ font-size: 16px; line-height: 1.6; opacity: 0.9; }}
+    .full-text {{ margin-top: 10px; }}
+
+    .text-scroll-zone {{ position: relative; overflow: hidden; transition: max-height 0.5s ease; padding-bottom: 10px; }}
+
+    @media (min-width: 961px) {{
+        .text-scroll-zone {{ max-height: 250px; }}
+        .text-scroll-zone.expanded {{ max-height: 2000px !important; }}
+        .toggle-btn-wrapper {{ margin-top: auto; padding-top: 15px; display: none; }}
+    }}
+
+    @media (max-width: 960px) {{
+        .event-wrapper {{ flex-direction: column; align-items: center; padding: 75px 20px 40px; gap: 0; }}
+        .event-image {{ width: 100%; max-width: 450px; flex: none; margin-bottom: 20px; }}
+        .event-content {{ width: 100%; align-items: center; gap: 12px; }}
+        .event-title {{ font-size: 32px; text-align: center; margin-bottom: 0; }}
+        .event-datetime {{ text-align: center; margin-bottom: 8px; }}
+        .buttons-row {{ justify-content: center !important; margin-bottom: 10px; }}
+        .text-container {{ width: 100%; }}
+        .text-scroll-zone {{ max-height: 115px; }}
+        .text-scroll-zone.active {{ max-height: 2000px !important; }}
+
+        .text-scroll-zone:not(.expanded):not(.active)::after {{
+            content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 50px;
+            background: linear-gradient(transparent, #070707); pointer-events: none; z-index: 2;
+        }}
+
+        .toggle-btn-wrapper {{ width: 100%; display: flex; justify-content: center; margin-top: 15px; }}
+        .text-preview, .full-text {{ text-align: justify !important; }}
+    }}
+
+    @media (min-width: 601px) and (max-width: 960px) {{
+        .text-container {{ max-width: 700px; padding: 0 45px; margin: 0 auto; }}
+    }}
+
+    .toggle-btn {{
+        background: transparent; border: 1px solid rgba(255,255,255,0.5); color: #fff;
+        padding: 10px 24px; border-radius: 30px; cursor: pointer;
+        display: flex; align-items: center; gap: 8px; font-size: 14px;
+    }}
+    .toggle-btn .arrow {{ font-size: 10px; transition: 0.3s; }}
+</style>
+
+<script>
+    function goBackSafe() {{
+        if (document.referrer.includes(window.location.hostname)) {{ window.history.back(); }}
+        else {{ window.location.href = 'https://mtbarmoscow.com/'; }}
+    }}
+
+    function toggleText() {{
+        const zone = document.getElementById('textZone');
+        const btnText = document.querySelector('.toggle-btn .btn-text');
+        const arrow = document.querySelector('.toggle-btn .arrow');
+        const isDesktop = window.innerWidth > 960;
+
+        if (isDesktop) {{ zone.classList.toggle('expanded'); }}
+        else {{ zone.classList.toggle('active'); }}
+
+        const isOpen = zone.classList.contains('expanded') || zone.classList.contains('active');
+        btnText.textContent = isOpen ? 'Свернуть' : 'Читать далее';
+        arrow.style.transform = isOpen ? 'rotate(180deg)' : 'rotate(0deg)';
+    }}
+
+    window.addEventListener('load', () => {{
+        const zone = document.getElementById('textZone');
+        const wrapper = document.getElementById('toggleWrapper');
+        const isDesktop = window.innerWidth > 960;
+
+        if (isDesktop) {{
+            const imgHeight = document.querySelector('.event-image').offsetHeight;
+            const contentTop = zone.getBoundingClientRect().top;
+            const wrapperTop = document.querySelector('.event-wrapper').getBoundingClientRect().top;
+            const offset = contentTop - wrapperTop;
+            const availableHeight = imgHeight - offset - 15;
+
+            zone.style.maxHeight = availableHeight + 'px';
+
+            if (zone.scrollHeight > availableHeight + 20) {{
+                wrapper.style.display = 'flex';
+            }} else {{
+                zone.style.maxHeight = 'none';
+            }}
+        }} else {{
+            if (zone.scrollHeight > 125) {{
+                wrapper.style.display = 'flex';
+            }} else {{
+                zone.style.maxHeight = 'none';
+            }}
+        }}
+    }});
+</script>"""
 
     m = missing(c)
     warnings = []
-    if 'афиша'  in m: warnings.append('⚠️ Афиша не добавлена — замени `ССЫЛКА_НА_АФИШУ`')
+    if 'афиша'  in m: warnings.append('⚠️ Афиша не добавлена — замени ССЫЛКА_НА_АФИШУ')
     if 'билеты' in m: warnings.append('⚠️ Билеты не добавлены')
     if 'текст'  in m: warnings.append('⚠️ Текст не добавлен')
     if 'дата'   in m: warnings.append('⚠️ Дата не установлена')
@@ -1055,15 +1189,16 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     header = f'🎤 *{artist}* — код для Tilda Zero Block'
     if warnings:
         header += '\n\n' + '\n'.join(warnings)
-    header += f'\n\nПосле публикации → `/publish {cid}`'
+    header += f'\n\nВставь содержимое файла в Zero Block → HTML\nПосле публикации → `/publish {cid}`'
 
     await upd.message.reply_text(header, parse_mode='Markdown')
-    msg = f'```html\n{html}\n```'
-    if len(msg) <= 4096:
-        await upd.message.reply_text(msg, parse_mode='Markdown')
-    else:
-        await upd.message.reply_text(f'```html\n{html[:3800]}\n```', parse_mode='Markdown')
-        await upd.message.reply_text(f'```html\n{html[3800:]}\n```', parse_mode='Markdown')
+
+    # Отправляем как файл — без обрезки
+    import io
+    fname   = f"{artist.lower().replace(' ', '_')}_{cid}.html"
+    bio     = io.BytesIO(full_code.encode('utf-8'))
+    bio.name = fname
+    await upd.message.reply_document(document=bio, filename=fname)
 
 
 # ─── ОБРАБОТЧИК ТЕКСТА ────────────────────────────────────────────────────────
