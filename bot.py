@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTB Concerts Bot — v5.1
-Изменения:
-1. Поле yandex_music_url в БД и в триггерах
-2. GoogleSheetsManager получает db_all как callback (фикс бага с календарём)
-3. Slug для страницы (без даты, без дефисов) — make_page_slug
-4. HTML шаблон обновлён до v3 (Яндекс Музыка кнопка, line-clamp toggle)
+MTB Concerts Bot — v5
+Все правки из чеклиста:
+1. /new — любой порядок слов, предлагает создать если имя+дата без команды
+2. /edit [номер] — редактирует конкретное, без номера — список
+3. Защита от дублей при создании
+4. /list afisha/tickets/text — фильтры по отсутствующим полям
+5. /list 2026-04 — по месяцам
+6. После даты без времени — спрашивает время
 """
 
 import os
@@ -34,7 +36,10 @@ OWNER_ID  = int(os.getenv('OWNER_ID', '534303997'))
 SHEETS_ID = os.getenv('GOOGLE_SHEETS_ID', '')
 DB_PATH   = 'concerts.db'
 
-# ✅ sheets инициализируется после определения db_all (см. конец секции БД)
+sheets = GoogleSheetsManager(
+    spreadsheet_id=SHEETS_ID if SHEETS_ID else None,
+    get_all_concerts_fn=lambda: db_all(include_cancelled=False),
+)
 
 KW = {
     'tickets': ['билеты', 'билет', 'ticket', 'tickets'],
@@ -42,7 +47,6 @@ KW = {
     'text':    ['текст', 'описание', 'text'],
     'date':    ['дата', 'date', 'перенос'],
     'cancel':  ['отмена', 'отменен', 'отменён', 'отменили', 'cancel'],
-    'yandex':  ['яндекс', 'yandex', 'музыка', 'music'],  # ✅ новый триггер
 }
 POSTER_OK = ['одобрена', 'ок', 'ok', 'утверждена', 'готова', 'approved']
 
@@ -59,18 +63,11 @@ def init_db():
             poster_file_id   TEXT,
             tickets_url      TEXT,
             description_text TEXT,
-            yandex_music_url TEXT,
             status           TEXT DEFAULT 'draft',
             created_at       TEXT DEFAULT (datetime('now')),
             updated_at       TEXT DEFAULT (datetime('now'))
         )''')
         conn.execute('CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)')
-
-        # ✅ Миграция: добавляем yandex_music_url если таблица уже существовала
-        existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(concerts)")]
-        if 'yandex_music_url' not in existing_cols:
-            conn.execute("ALTER TABLE concerts ADD COLUMN yandex_music_url TEXT")
-            logger.info("✅ Миграция: добавлена колонка yandex_music_url")
 
 def db_save(data: dict) -> int:
     with sqlite3.connect(DB_PATH) as conn:
@@ -78,23 +75,21 @@ def db_save(data: dict) -> int:
         if data.get('id'):
             conn.execute('''UPDATE concerts SET
                 artist=?, date=?, time=?, poster_status=?, poster_file_id=?,
-                tickets_url=?, description_text=?, yandex_music_url=?, status=?, updated_at=?
+                tickets_url=?, description_text=?, status=?, updated_at=?
                 WHERE id=?''', (
                 data.get('artist'), data.get('date'), data.get('time'),
                 data.get('poster_status', 'none'), data.get('poster_file_id'),
                 data.get('tickets_url'), data.get('description_text'),
-                data.get('yandex_music_url'),
                 data.get('status', 'draft'), now, data['id']
             ))
             return data['id']
         else:
             cur = conn.execute('''INSERT INTO concerts
-                (artist, date, time, poster_status, tickets_url, description_text, yandex_music_url, status)
-                VALUES (?,?,?,?,?,?,?,?)''', (
+                (artist, date, time, poster_status, tickets_url, description_text, status)
+                VALUES (?,?,?,?,?,?,?)''', (
                 data.get('artist'), data.get('date'), data.get('time'),
                 data.get('poster_status', 'none'), data.get('tickets_url'),
-                data.get('description_text'), data.get('yandex_music_url'),
-                data.get('status', 'draft')
+                data.get('description_text'), data.get('status', 'draft')
             ))
             return cur.lastrowid
 
@@ -123,17 +118,13 @@ def get_chats() -> List[int]:
     with sqlite3.connect(DB_PATH) as conn:
         return [r[0] for r in conn.execute('SELECT chat_id FROM chats').fetchall()]
 
-# ✅ sheets инициализируется после db_all — передаём callback
-sheets = GoogleSheetsManager(
-    spreadsheet_id=SHEETS_ID if SHEETS_ID else None,
-    get_all_concerts_fn=db_all,  # ✅ фикс бага с календарём
-)
-
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ──────────────────────────────────────────────────
 
+# Латиница → кириллица для часто путаемых символов
 _CYR_LAT = str.maketrans('aceopxyABCEHKMOPTX', 'асеорхуАВСЕНКМОРТХ')
 
 def norm(text: str) -> str:
+    """Нормализация с заменой латиницы на кириллицу."""
     text = text.lower()
     text = text.translate(_CYR_LAT)
     text = text.replace('ё', 'е')
@@ -141,7 +132,7 @@ def norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 def transliterate(text: str) -> str:
-    """ИВАН ДОРН → ivan-dorn (slug с дефисами, для SEO)"""
+    """ИВАН ДОРН → ivan-dorn"""
     table = {
         'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e',
         'ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m',
@@ -158,29 +149,8 @@ def transliterate(text: str) -> str:
     result = re.sub(r'\s+', '-', result.strip())
     return re.sub(r'-+', '-', result)
 
-def make_page_slug(artist: str) -> str:
-    """
-    ✅ Slug для URL страницы Tilda — без даты, без дефисов, слитно.
-    Маша и Медведи → mashaimedvedi
-    Depeche Mode   → depechemode
-    """
-    table = {
-        'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e',
-        'ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m',
-        'н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u',
-        'ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'sch',
-        'ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
-    }
-    result = ''
-    for ch in artist.lower():
-        if ch in table:
-            result += table[ch]
-        elif ch.isascii() and ch.isalpha():
-            result += ch
-    return result
-
 def make_slug(artist: str, date_str: str = '') -> str:
-    """SEO slug с датой: ivan-dorn-15-04-2026"""
+    """Иван Дорн + 15.04.2026 → ivan-dorn-15-04-2026"""
     slug = transliterate(artist)
     if date_str:
         slug += '-' + date_str.replace('.', '-')
@@ -198,11 +168,13 @@ MONTHS = {
 def extract_date_time(text: str) -> Tuple[Optional[str], Optional[str]]:
     date_str = time_str = None
 
+    # DD.MM.YYYY или DD/MM/YYYY или DD-MM-YYYY
     m = re.search(r'(\d{1,2})[./\-](\d{1,2})[./\-](\d{4})', text)
     if m:
         d, mo, y = m.groups()
         date_str = f"{int(d):02d}.{int(mo):02d}.{y}"
 
+    # DD месяц YYYY
     if not date_str:
         pat = r'(\d{1,2})\s+(' + '|'.join(MONTHS) + r')(?:\s+(\d{4}))?'
         m = re.search(pat, text.lower())
@@ -210,6 +182,7 @@ def extract_date_time(text: str) -> Tuple[Optional[str], Optional[str]]:
             d, mo_s, y = m.group(1), m.group(2), m.group(3) or str(datetime.now().year)
             date_str = f"{int(d):02d}.{MONTHS[mo_s]:02d}.{y}"
 
+    # DD.MM (без года)
     if not date_str:
         m = re.search(r'\b(\d{1,2})[./](\d{1,2})\b', text)
         if m:
@@ -217,6 +190,7 @@ def extract_date_time(text: str) -> Tuple[Optional[str], Optional[str]]:
             y = str(datetime.now().year)
             date_str = f"{int(d):02d}.{int(mo):02d}.{y}"
 
+    # Время HH:MM или HH.MM
     m = re.search(r'\b(\d{1,2})[:\.](\d{2})\b', text)
     if m:
         h, mi = m.groups()
@@ -226,6 +200,7 @@ def extract_date_time(text: str) -> Tuple[Optional[str], Optional[str]]:
     return date_str, time_str
 
 def strip_date_time(text: str) -> str:
+    """Убирает дату и время из текста."""
     cleaned = re.sub(r'\d{1,2}[./\-]\d{1,2}[./\-]\d{4}', '', text)
     cleaned = re.sub(r'\b\d{1,2}[./]\d{1,2}\b', '', cleaned)
     cleaned = re.sub(r'\b\d{1,2}[:.]\d{2}\b', '', cleaned)
@@ -234,6 +209,9 @@ def strip_date_time(text: str) -> str:
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 def fuzzy_find(name: str, soft=False) -> List[dict]:
+    """
+    soft=True — возвращает также совпадения 60-69 (для "ты имел в виду?")
+    """
     all_c  = db_all()
     name_n = norm(name)
     results = []
@@ -251,6 +229,7 @@ def fuzzy_find(name: str, soft=False) -> List[dict]:
         return []
     results.sort(key=lambda x: x[1], reverse=True)
     top = results[0][1]
+    # Одно явное совпадение
     if top >= 90 or (len(results) >= 2 and top - results[1][1] >= 20):
         return [results[0][0]]
     return [r[0] for r in results[:5]]
@@ -289,7 +268,6 @@ def card(c: dict) -> str:
         f"{'✅' if c.get('tickets_url') else '❌'} Билеты\n"
         f"{'✅' if c.get('description_text') else '❌'} Текст\n"
         f"{'✅' if c.get('date') else '❌'} Дата\n"
-        f"{'✅' if c.get('yandex_music_url') else '➖'} Яндекс Музыка\n"  # ✅
     )
     if m:
         text += f"\n❗ Не хватает: {', '.join(m)}"
@@ -299,15 +277,14 @@ def card(c: dict) -> str:
 
 def edit_kb(cid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Дата",        callback_data=f"ed|date|{cid}"),
-         InlineKeyboardButton("🖼 Афиша ✓",     callback_data=f"do|poster|{cid}")],
-        [InlineKeyboardButton("🎟 Билеты",      callback_data=f"ed|tickets|{cid}"),
-         InlineKeyboardButton("📝 Текст",       callback_data=f"ed|text|{cid}")],
-        [InlineKeyboardButton("🎵 Яндекс",      callback_data=f"ed|yandex|{cid}"),    # ✅
-         InlineKeyboardButton("✏️ Артист",      callback_data=f"ed|artist|{cid}")],
-        [InlineKeyboardButton("🚫 Отменить",    callback_data=f"do|cancel|{cid}"),
-         InlineKeyboardButton("⚫ Опубликовать", callback_data=f"do|publish|{cid}")],
-        [InlineKeyboardButton("🗑 Удалить",     callback_data=f"do|delete|{cid}")],
+        [InlineKeyboardButton("📅 Дата",      callback_data=f"ed|date|{cid}"),
+         InlineKeyboardButton("🖼 Афиша ✓",   callback_data=f"do|poster|{cid}")],
+        [InlineKeyboardButton("🎟 Билеты",    callback_data=f"ed|tickets|{cid}"),
+         InlineKeyboardButton("📝 Текст",     callback_data=f"ed|text|{cid}")],
+        [InlineKeyboardButton("✏️ Артист",    callback_data=f"ed|artist|{cid}"),
+         InlineKeyboardButton("🚫 Отменить",  callback_data=f"do|cancel|{cid}")],
+        [InlineKeyboardButton("⚫ Опубликовать", callback_data=f"do|publish|{cid}"),
+         InlineKeyboardButton("🗑 Удалить",   callback_data=f"do|delete|{cid}")],
     ])
 
 async def notify_ready(ctx: ContextTypes.DEFAULT_TYPE, c: dict):
@@ -330,13 +307,20 @@ def detect_kw(text: str) -> Optional[Tuple[str, str]]:
     for action, keywords in KW.items():
         for kw in keywords:
             kw_n = norm(kw)
+
+            # 1. Прямое вхождение подстроки (ловит "билеты!" "билеты,")
             if kw_n in text_n:
                 return action, kw
+
+            # 2. Fuzzy по каждому слову (ловит "билетсы", "тикетс")
             for w in words:
                 if len(w) >= 4 and fuzz.partial_ratio(kw_n, w) >= 80:
                     return action, w
+
+            # 3. Fuzzy по всей строке (ловит опечатки в разных позициях)
             if fuzz.partial_ratio(kw_n, text_n) >= 85:
                 return action, kw
+
     return None
 
 STOP_WORDS = [
@@ -345,6 +329,7 @@ STOP_WORDS = [
 ]
 
 def parse_trigger(text: str) -> Optional[dict]:
+    """Любой порядок: Артист билеты URL / билеты Артист URL / и т.д."""
     text = text.strip()
     if not text:
         return None
@@ -353,20 +338,27 @@ def parse_trigger(text: str) -> Optional[dict]:
         return None
     action, found_kw = result
 
+    # Убираем URL, ключевые слова, даты — остаток = артист
     cleaned = re.sub(r'https?://\S+', '', text)
     all_kw  = [w for ws in KW.values() for w in ws] + POSTER_OK
     for kw in all_kw:
         cleaned = re.sub(r'(?i)\b' + re.escape(kw) + r'\b', '', cleaned)
     cleaned = strip_date_time(cleaned)
+
+    # Убираем стоп-слова (мусор)
     for sw in STOP_WORDS:
         cleaned = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', cleaned)
 
     artist = re.sub(r'\s+', ' ', cleaned).strip()
+
     if not artist or len(artist) < 2:
         return None
+
+    # Защита от мусора — слишком длинное "имя артиста"
     if len(artist.split()) > 6:
         return None
 
+    # URL всегда берём из исходного текста
     url     = extract_url(text)
     payload = url or ''
 
@@ -386,17 +378,19 @@ def parse_trigger(text: str) -> Optional[dict]:
     elif action == 'poster':
         payload = text
 
-    elif action == 'yandex':
-        # payload = URL яндекс музыки
-        payload = url or ''
-
     return {'artist': artist, 'action': action, 'payload': payload}
 
 def parse_free_text(text: str) -> Optional[dict]:
+    """
+    Распознаёт свободный ввод БЕЗ команды:
+    'Иван Дорн 15.04.2026 21:00' → предложить создать
+    Возвращает {artist, date, time} или None
+    """
     d, t    = extract_date_time(text)
     if not d:
         return None
     artist = strip_date_time(text).strip()
+    # Убираем URL
     artist = re.sub(r'https?://\S+', '', artist).strip()
     if len(artist) < 2:
         return None
@@ -459,6 +453,7 @@ async def apply_action(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
         ctx.user_data[f'v_{cid}'] = (d, t)
         dt = f"{d} {t or ''}".strip()
         if not t:
+            # Спрашиваем время отдельно
             ctx.user_data[f'aw_time_{cid}'] = d
             kb = [[InlineKeyboardButton("Пропустить", callback_data=f"do|date|{cid}")]]
             await msg.reply_text(
@@ -471,19 +466,6 @@ async def apply_action(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|date|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
         await msg.reply_text(f"Установить дату *{name}*: `{dt}`?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-
-    elif action == 'yandex':  # ✅ новое
-        url = extract_url(payload) or extract_url(upd.effective_message.text or '')
-        if not url:
-            await msg.reply_text(f"Нет ссылки.\nПример: `{name} яндекс https://music.yandex.ru/...`",
-                                 parse_mode='Markdown')
-            return
-        ctx.user_data[f'v_{cid}'] = url
-        label = "Обновить" if c.get('yandex_music_url') else "Добавить"
-        kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|yandex|{cid}"),
-               InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"{label} Яндекс Музыку для *{name}*?",
                              reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
 # ─── ОБРАБОТКА ТРИГГЕРА ───────────────────────────────────────────────────────
@@ -571,13 +553,6 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await notify_ready(ctx, c)
                 await q.edit_message_text(f"✅ Текст добавлен — *{c['artist']}*", parse_mode='Markdown')
 
-        elif action == 'yandex':  # ✅
-            url = ctx.user_data.pop(f'v_{cid}', None)
-            if url:
-                c['yandex_music_url'] = url
-                db_save(c); sheets.sync_concert(c)
-                await q.edit_message_text(f"✅ Яндекс Музыка добавлена — *{c['artist']}*", parse_mode='Markdown')
-
         elif action == 'date':
             val = ctx.user_data.pop(f'v_{cid}', None)
             if val:
@@ -622,7 +597,6 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             'tickets': f"🎟 Ссылка для *{c['artist']}*:",
             'text':    f"📝 Описание для *{c['artist']}*:",
             'artist':  f"✏️ Новое имя (сейчас: {c['artist']}):",
-            'yandex':  f"🎵 Ссылка Яндекс Музыка для *{c['artist']}*:",  # ✅
         }
         await q.edit_message_text(prompts.get(field, 'Введи:'), parse_mode='Markdown')
         return
@@ -634,6 +608,7 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
 
     if data.startswith('new_confirm|'):
+        # cnew from free text: new_confirm|artist|date|time
         parts  = data.split('|')
         artist = parts[1]
         d      = parts[2] or None
@@ -643,6 +618,7 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
 
     if data.startswith('upd_date|'):
+        # Обновить дату существующего артиста из свободного ввода
         parts = data.split('|')
         cid   = int(parts[1])
         d     = parts[2] or None
@@ -653,9 +629,8 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if t: c['time'] = t
             db_save(c); sheets.sync_concert(c)
             await notify_ready(ctx, c)
-            dt = f"{d} {t or ''}".strip()
             await q.edit_message_text(
-                f"✅ Дата *{c['artist']}* обновлена: `{dt}`",
+                f"✅ Дата *{c['artist']}* обновлена: `{d} {t or ''}`.strip()",
                 parse_mode='Markdown'
             )
 
@@ -669,6 +644,7 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     ctx.user_data.pop('aw')
     text = (upd.message.text or '').strip()
 
+    # Время после даты без времени
     if field == 'time_for_date':
         if not cid:
             return False
@@ -709,6 +685,7 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
                     reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
                 )
             else:
+                # Спросить время
                 ctx.user_data[f'aw_time_{cid}'] = d
                 ctx.user_data['aw']    = 'time_for_date'
                 ctx.user_data['aw_id'] = cid
@@ -726,8 +703,6 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
         c['description_text'] = text
     elif field == 'artist':
         c['artist'] = text
-    elif field == 'yandex':  # ✅
-        c['yandex_music_url'] = extract_url(text) or text
     else:
         return False
 
@@ -751,7 +726,6 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`Иван Дорн афиша одобрена`\n"
         "`Иван Дорн текст Описание...`\n"
         "`Иван Дорн дата 15.04.2026 21:00`\n"
-        "`Иван Дорн яндекс https://music.yandex.ru/...`\n"
         "`Иван Дорн отмена`\n\n"
         "*Или просто напиши имя + дату:*\n"
         "`Иван Дорн 15.04.2026 21:00`\n\n"
@@ -785,6 +759,7 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Парсим любой порядок: дата, время, имя
     d, t    = extract_date_time(args)
     artist  = strip_date_time(args).strip()
 
@@ -798,6 +773,7 @@ async def cmd_new(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _create_or_warn(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
                            artist: str, d: Optional[str], t: Optional[str]):
+    """Проверяет дубли и создаёт или предупреждает."""
     msg     = upd.effective_message
     matches = fuzzy_find(artist)
     exact   = [c for c in matches if norm(c['artist']) == norm(artist)]
@@ -817,6 +793,7 @@ async def _create_or_warn(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
     cid = db_save({'artist': artist, 'date': d, 'time': t})
     c   = db_get(cid)
 
+    # Если дата есть но времени нет — спросить время
     if d and not t:
         ctx.user_data[f'aw_time_{cid}'] = d
         ctx.user_data['aw']    = 'time_for_date'
@@ -834,6 +811,7 @@ async def _create_or_warn(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
 
 async def cmd_edit(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # /edit 5 — сразу открыть карточку
     if ctx.args:
         try:
             cid = int(ctx.args[0])
@@ -846,6 +824,7 @@ async def cmd_edit(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                          parse_mode='Markdown')
             return
         except ValueError:
+            # Попробуем как имя
             name    = ' '.join(ctx.args)
             matches = fuzzy_find(name)
             if len(matches) == 1:
@@ -862,6 +841,7 @@ async def cmd_edit(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await upd.message.reply_text("Уточни:", reply_markup=InlineKeyboardMarkup(kb))
                 return
 
+    # /edit без аргументов — показать список
     concerts = [c for c in db_all() if c['status'] == 'draft']
     if not concerts:
         await upd.message.reply_text("Нет активных мероприятий. Создай: `/new`", parse_mode='Markdown')
@@ -880,6 +860,7 @@ async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     register_chat(upd.effective_chat.id)
     arg = ctx.args[0].lower() if ctx.args else ''
 
+    # Фильтры по отсутствующим полям
     FILTERS = {
         'afisha': ('афиша', lambda c: c.get('poster_status') != 'approved'),
         'афиша':  ('афиша', lambda c: c.get('poster_status') != 'approved'),
@@ -902,6 +883,7 @@ async def cmd_list(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await upd.message.reply_text('\n'.join(lines), parse_mode='Markdown')
         return
 
+    # Фильтр по месяцу YYYY-MM
     month_filter = arg if re.match(r'^\d{4}-\d{2}$', arg) else None
     inc_all      = arg == 'all'
     concerts     = db_all(include_cancelled=inc_all)
@@ -1052,17 +1034,12 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url        = c.get('tickets_url', '') or ''
     poster_url = c.get('poster_file_id', '') or 'ССЫЛКА_НА_АФИШУ'
     desc       = c.get('description_text', '') or ''
-    yandex_url = c.get('yandex_music_url', '') or ''
 
-    # Разбиваем описание на параграфы
     paragraphs = [p.strip() for p in desc.split('\n\n') if p.strip()]
-    if not paragraphs and desc:
-        paragraphs = [desc]
+    first_para = paragraphs[0] if paragraphs else desc
+    rest_paras = '<br><br>'.join(paragraphs[1:]) if len(paragraphs) > 1 else ''
 
-    paras_html = '\n'.join(f'                    <p>{p}</p>' for p in paragraphs) if paragraphs else \
-                 '                    <p>Описание появится позже.</p>'
-
-    # ✅ Обновлённый шаблон v3 (с Яндекс Музыкой, line-clamp toggle)
+    # Полный шаблон — HTML + CSS + JS
     full_code = f"""<div class="event-wrapper">
     <button class="back-btn" onclick="goBackSafe(); return false;">
         <span class="arrow-left">←</span>
@@ -1081,19 +1058,19 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             <button class="buy-btn" onclick="window.open('{url}', '_blank')">
                 Купить билет
             </button>
-            <button class="yandex-btn" data-yandex-link="{yandex_url}" onclick="window.open(this.getAttribute('data-yandex-link'), '_blank')">
-                Яндекс Музыка
-            </button>
         </div>
 
-        <div class="text-content-wrapper">
-            <div class="text-content" id="textContent">
-                <div class="text-full">
-{paras_html}
-                </div>
+        <div class="text-container" id="textContainer">
+            <div class="text-scroll-zone" id="textZone">
+                <p class="text-preview">
+                    {first_para}
+                </p>
+                <p class="full-text">
+                    {rest_paras}
+                </p>
             </div>
 
-            <div class="toggle-btn-wrapper">
+            <div class="toggle-btn-wrapper" id="toggleWrapper" style="display: none;">
                 <button class="toggle-btn" onclick="toggleText()">
                     <span class="btn-text">Читать далее</span>
                     <span class="arrow">▼</span>
@@ -1105,220 +1082,129 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ background: #070707; color: #fff; font-family: 'Winston', sans-serif; font-weight: 400; overflow-x: hidden; }}
 
-    body {{
-        background: #070707;
-        color: #fff;
-        font-family: 'Winston', sans-serif;
-        font-weight: 400;
-        overflow-x: hidden;
-    }}
     .event-wrapper {{
-        max-width: 1200px;
-        margin: 0 auto;
-        display: flex;
-        gap: 40px;
-        padding: 80px 20px 40px;
-        position: relative;
-        align-items: flex-start;
+        max-width: 1200px; margin: 0 auto; display: flex; gap: 40px;
+        padding: 80px 20px 40px; position: relative; align-items: flex-start;
     }}
+
     .back-btn {{
         position: absolute; top: 25px; left: 20px;
         background: transparent; border: none; color: #fff;
         font-size: 14px; font-weight: 500; cursor: pointer;
         display: inline-flex; align-items: center; gap: 8px; z-index: 10;
     }}
+
     .event-image {{
-        flex: 0 0 450px;
-        width: 450px;
-        height: 450px;
-        overflow: hidden;
-        background: #111;
-        border-radius: 0 !important;
-        flex-shrink: 0;
+        flex: 0 0 450px; width: 450px; aspect-ratio: 1 / 1 !important;
+        overflow: hidden; background: #111;
     }}
-    .event-image img {{
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-        display: block;
-    }}
-    .event-content {{
-        flex: 1;
-        min-width: 0;
-        display: flex;
-        flex-direction: column;
-    }}
-    .event-title {{
-        font-size: 38px; letter-spacing: 2px; margin-bottom: 10px; line-height: 1.1;
-        text-transform: uppercase; font-weight: 400 !important;
-    }}
+    .event-image img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+
+    .event-content {{ flex: 1; min-width: 0; display: flex; flex-direction: column; align-self: stretch; }}
+
+    .event-title {{ font-size: 38px; letter-spacing: 2px; line-height: 1.1; text-transform: uppercase; font-weight: 400 !important; margin-bottom: 10px; }}
     .event-datetime {{ font-size: 18px; color: #f5ce3e; margin-bottom: 25px; }}
-    .buttons-row {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
+    .buttons-row {{ display: flex; gap: 15px; margin-bottom: 25px; }}
 
-    .buy-btn, .yandex-btn, .toggle-btn {{
-        padding: 14px 30px;
-        font-size: 15px;
-        font-family: 'Winston', sans-serif;
-        font-weight: 600 !important;
-        border-radius: 30px;
-        cursor: pointer;
-        transition: 0.3s;
-        text-transform: none !important;
-        width: fit-content;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        text-align: center;
+    .buy-btn {{
+        padding: 14px 30px; font-size: 15px; font-family: 'Winston', sans-serif; font-weight: 600;
+        border-radius: 30px; cursor: pointer; transition: 0.3s; border: none;
+        background: #f5ce3e; color: #000 !important;
     }}
-    .buy-btn {{ background: #f5ce3e; color: #000; border: none; }}
-    .yandex-btn, .toggle-btn {{
-        background: transparent;
-        border: 1px solid rgba(255,255,255,0.5);
-        color: #fff;
-        gap: 8px;
-    }}
-    .yandex-btn.hidden {{ display: none !important; }}
 
-    .text-content-wrapper {{
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        min-height: 0;
-    }}
-    .text-content {{ flex: 0 0 auto; }}
-    .text-full {{
-        font-size: 16px;
-        line-height: 1.6;
-        opacity: 0.9;
-    }}
-    .text-full p {{ margin-bottom: 10px; }}
-    .text-full p:last-child {{ margin-bottom: 0; }}
+    .text-container {{ flex: 1; display: flex; flex-direction: column; min-height: 0; }}
+    .text-preview, .full-text {{ font-size: 16px; line-height: 1.6; opacity: 0.9; }}
+    .full-text {{ margin-top: 10px; }}
 
-    .text-content:not(.expanded) .text-full {{
-        display: -webkit-box;
-        -webkit-line-clamp: 8;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-    }}
-    .text-content.expanded .text-full {{ display: block; }}
-
-    .toggle-btn-wrapper {{
-        width: 100%;
-        display: flex;
-        justify-content: flex-start;
-        margin-top: 20px;
-    }}
-    .toggle-btn {{
-        font-size: 14px;
-        padding: 10px 24px;
-        display: none;
-    }}
-    .toggle-btn.visible {{ display: inline-flex; }}
-    .toggle-btn .arrow {{ font-size: 10px; transition: 0.3s; }}
+    .text-scroll-zone {{ position: relative; overflow: hidden; transition: max-height 0.5s ease; padding-bottom: 10px; }}
 
     @media (min-width: 961px) {{
-        .event-content {{ min-height: 450px; }}
-        .toggle-btn-wrapper {{ margin-top: auto; }}
+        .text-scroll-zone {{ max-height: 250px; }}
+        .text-scroll-zone.expanded {{ max-height: 2000px !important; }}
+        .toggle-btn-wrapper {{ margin-top: auto; padding-top: 15px; display: none; }}
     }}
 
     @media (max-width: 960px) {{
-        .event-wrapper {{
-            flex-direction: column;
-            align-items: center;
-            padding: 70px 8px 40px;
+        .event-wrapper {{ flex-direction: column; align-items: center; padding: 75px 20px 40px; gap: 0; }}
+        .event-image {{ width: 100%; max-width: 450px; flex: none; margin-bottom: 20px; }}
+        .event-content {{ width: 100%; align-items: center; gap: 12px; }}
+        .event-title {{ font-size: 32px; text-align: center; margin-bottom: 0; }}
+        .event-datetime {{ text-align: center; margin-bottom: 8px; }}
+        .buttons-row {{ justify-content: center !important; margin-bottom: 10px; }}
+        .text-container {{ width: 100%; }}
+        .text-scroll-zone {{ max-height: 115px; }}
+        .text-scroll-zone.active {{ max-height: 2000px !important; }}
+
+        .text-scroll-zone:not(.expanded):not(.active)::after {{
+            content: ''; position: absolute; bottom: 0; left: 0; width: 100%; height: 50px;
+            background: linear-gradient(transparent, #070707); pointer-events: none; z-index: 2;
         }}
-        .event-image {{
-            width: 100%;
-            max-width: 450px;
-            height: auto;
-            aspect-ratio: 1 / 1;
-            flex: none;
-            margin-bottom: 8px;
-        }}
-        .event-title {{
-            text-align: center;
-            width: 100%;
-            margin-bottom: 8px;
-        }}
-        .event-datetime {{
-            text-align: center;
-            width: 100%;
-            margin-bottom: 20px;
-        }}
-        .buttons-row {{ justify-content: center; width: 100%; }}
-        .toggle-btn-wrapper {{ justify-content: center; }}
-        .text-content-wrapper {{ width: 100%; }}
-        .text-full {{ text-align: justify !important; }}
-        .event-content {{ min-height: 0; }}
-        .text-content:not(.expanded) .text-full {{ -webkit-line-clamp: 5; }}
+
+        .toggle-btn-wrapper {{ width: 100%; display: flex; justify-content: center; margin-top: 15px; }}
+        .text-preview, .full-text {{ text-align: justify !important; }}
     }}
 
-    @media (max-width: 480px) {{
-        .event-title {{ font-size: 28px; }}
-        .buttons-row {{ flex-direction: column; align-items: center; }}
-        .buy-btn, .yandex-btn {{ min-width: 260px; }}
+    @media (min-width: 601px) and (max-width: 960px) {{
+        .text-container {{ max-width: 700px; padding: 0 45px; margin: 0 auto; }}
     }}
+
+    .toggle-btn {{
+        background: transparent; border: 1px solid rgba(255,255,255,0.5); color: #fff;
+        padding: 10px 24px; border-radius: 30px; cursor: pointer;
+        display: flex; align-items: center; gap: 8px; font-size: 14px;
+    }}
+    .toggle-btn .arrow {{ font-size: 10px; transition: 0.3s; }}
 </style>
 
 <script>
     function goBackSafe() {{
-        const currentHost = window.location.hostname;
-        const referrer = document.referrer;
-        if (referrer && referrer.includes(currentHost)) {{
-            window.history.back();
-            setTimeout(() => {{
-                if (window.location.href.includes(window.location.pathname)) {{
-                    window.location.href = 'https://mtbarmoscow.com/';
-                }}
-            }}, 200);
-        }} else {{
-            window.location.href = 'https://mtbarmoscow.com/';
-        }}
+        if (document.referrer.includes(window.location.hostname)) {{ window.history.back(); }}
+        else {{ window.location.href = 'https://mtbarmoscow.com/'; }}
     }}
 
     function toggleText() {{
-        const content = document.getElementById('textContent');
+        const zone = document.getElementById('textZone');
         const btnText = document.querySelector('.toggle-btn .btn-text');
         const arrow = document.querySelector('.toggle-btn .arrow');
+        const isDesktop = window.innerWidth > 960;
 
-        content.classList.toggle('expanded');
-        btnText.textContent = content.classList.contains('expanded') ? 'Свернуть' : 'Читать далее';
-        arrow.style.transform = content.classList.contains('expanded') ? 'rotate(180deg)' : 'rotate(0deg)';
+        if (isDesktop) {{ zone.classList.toggle('expanded'); }}
+        else {{ zone.classList.toggle('active'); }}
+
+        const isOpen = zone.classList.contains('expanded') || zone.classList.contains('active');
+        btnText.textContent = isOpen ? 'Свернуть' : 'Читать далее';
+        arrow.style.transform = isOpen ? 'rotate(180deg)' : 'rotate(0deg)';
     }}
 
-    function checkIfToggleNeeded() {{
-        const textContent = document.getElementById('textContent');
-        const textFull = document.querySelector('.text-full');
-        const toggleBtn = document.querySelector('.toggle-btn');
+    window.addEventListener('load', () => {{
+        const zone = document.getElementById('textZone');
+        const wrapper = document.getElementById('toggleWrapper');
+        const isDesktop = window.innerWidth > 960;
 
-        if (!textFull || !toggleBtn) return;
+        if (isDesktop) {{
+            const imgHeight = document.querySelector('.event-image').offsetHeight;
+            const contentTop = zone.getBoundingClientRect().top;
+            const wrapperTop = document.querySelector('.event-wrapper').getBoundingClientRect().top;
+            const offset = contentTop - wrapperTop;
+            const availableHeight = imgHeight - offset - 15;
 
-        const lineHeight = parseFloat(window.getComputedStyle(textFull).lineHeight);
-        const clamp = window.innerWidth > 960 ? 8 : 5;
-        const maxHeight = lineHeight * clamp;
+            zone.style.maxHeight = availableHeight + 'px';
 
-        if (textFull.scrollHeight > maxHeight + 4) {{
-            toggleBtn.classList.add('visible');
+            if (zone.scrollHeight > availableHeight + 20) {{
+                wrapper.style.display = 'flex';
+            }} else {{
+                zone.style.maxHeight = 'none';
+            }}
         }} else {{
-            toggleBtn.classList.remove('visible');
+            if (zone.scrollHeight > 125) {{
+                wrapper.style.display = 'flex';
+            }} else {{
+                zone.style.maxHeight = 'none';
+            }}
         }}
-    }}
-
-    function checkYandexButton() {{
-        const yandexBtn = document.querySelector('.yandex-btn');
-        if (!yandexBtn) return;
-        const yandexLink = yandexBtn.getAttribute('data-yandex-link');
-        if (!yandexLink || yandexLink.trim() === '') {{
-            yandexBtn.classList.add('hidden');
-        }}
-    }}
-
-    window.addEventListener('DOMContentLoaded', function() {{
-        checkIfToggleNeeded();
-        checkYandexButton();
     }});
-    window.addEventListener('resize', checkIfToggleNeeded);
 </script>"""
 
     m = missing(c)
@@ -1327,7 +1213,6 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if 'билеты' in m: warnings.append('⚠️ Билеты не добавлены')
     if 'текст'  in m: warnings.append('⚠️ Текст не добавлен')
     if 'дата'   in m: warnings.append('⚠️ Дата не установлена')
-    if not yandex_url:  warnings.append('ℹ️ Яндекс Музыка не добавлена (кнопка скрыта)')
 
     header = f'🎤 *{artist}* — код для Tilda Zero Block'
     if warnings:
@@ -1336,16 +1221,16 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await upd.message.reply_text(header, parse_mode='Markdown')
 
+    # Отправляем как файл — без обрезки
     import io
-    fname = f"{artist.lower().replace(' ', '_')}_{cid}.html"
-    bio   = io.BytesIO(full_code.encode('utf-8'))
+    fname   = f"{artist.lower().replace(' ', '_')}_{cid}.html"
+    bio     = io.BytesIO(full_code.encode('utf-8'))
     bio.name = fname
     await upd.message.reply_document(document=bio, filename=fname)
 
-    # SEO данные
-    page_slug = make_page_slug(artist)
-    seo_slug  = make_slug(artist, date_str)
-    seo_title = f"{artist} — концерт в Мумий Тролль Бар, Москва"
+    # Второе сообщение — SEO данные для Tilda
+    slug      = make_slug(artist, date_str)
+    seo_title = f"{artist} — праздничный концерт в Мумий Тролль Бар, Москва"
     seo_desc  = (
         f"Билеты на концерт {artist} в Мумий Тролль Бар, "
         f"музыкальный бар, ресторан с живой музыкой, "
@@ -1353,8 +1238,7 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     seo_msg = (
         f"📋 *SEO для страницы*\n\n"
-        f"*Адрес страницы (URL):*\n`https://mtbarmoscow.com/{page_slug}`\n\n"
-        f"*Slug для Tilda:*\n`{page_slug}`\n\n"
+        f"*Адрес страницы (slug):*\n`{slug}`\n\n"
         f"*SEO заголовок:*\n`{seo_title}`\n\n"
         f"*SEO описание:*\n`{seo_desc}`"
     )
@@ -1366,6 +1250,7 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (upd.message.text or '').strip()
 
+    # Ожидание имени при /new
     if ctx.user_data.get('aw') == 'create_name':
         ctx.user_data.pop('aw'); ctx.user_data.pop('aw_id', None)
         if text:
@@ -1374,20 +1259,24 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _create_or_warn(upd, ctx, artist, d, t)
         return
 
+    # Ожидание ввода из редактора
     if await handle_awaiting(upd, ctx):
         return
 
+    # Триггеры (Артист + действие)
     parsed = parse_trigger(text)
     if parsed:
         await process_trigger(upd, ctx, parsed)
         return
 
+    # Свободный ввод: Имя + дата → предложить создать или обновить дату
     free = parse_free_text(text)
     if free:
         artist  = free['artist']
         d, t    = free['date'], free['time']
         matches = fuzzy_find(artist)
         if matches:
+            # Артист найден → предложить обновить дату существующего
             c  = matches[0]
             dt = f"{d} {t or ''}".strip()
             kb = [[
@@ -1401,6 +1290,7 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
             )
         else:
+            # Артист не найден → предложить создать
             dt = f"{d} {t or ''}".strip()
             kb = [[
                 InlineKeyboardButton("✅ Создать", callback_data=f"new_confirm|{artist}|{d or ''}|{t or ''}"),
@@ -1412,8 +1302,9 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # "Ты имел в виду?" — мягкий fuzzy (60-65) без триггера
     if len(text.split()) <= 5:
-        soft   = fuzzy_find(text, soft=True)
+        soft = fuzzy_find(text, soft=True)
         strict = fuzzy_find(text)
         if soft and not strict:
             c  = soft[0]
@@ -1469,6 +1360,14 @@ async def morning_digest(ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"digest {chat_id}: {e}")
 
 
+async def cmd_rebuild(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Пересобирает все календари в Google Sheets."""
+    msg = await upd.message.reply_text("⏳ Пересобираю календари...")
+    all_c = db_all()
+    sheets.rebuild_all_calendars(all_c)
+    await msg.edit_text(f"✅ Готово! Пересобрано для {len(all_c)} мероприятий.")
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1485,6 +1384,7 @@ def main():
         ('cancel',  cmd_cancel),
         ('digest',  cmd_digest),
         ('code',    cmd_code),
+        ('rebuild', cmd_rebuild),
         ('help',    cmd_start),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
@@ -1496,7 +1396,7 @@ def main():
     if jq:
         jq.run_daily(morning_digest, time=dtime(hour=9, minute=0))
 
-    logger.info("🎸 MTB Concerts Bot v5.1 запущен!")
+    logger.info("🎸 MTB Concerts Bot v5 запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
