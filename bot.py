@@ -36,10 +36,7 @@ OWNER_ID  = int(os.getenv('OWNER_ID', '534303997'))
 SHEETS_ID = os.getenv('GOOGLE_SHEETS_ID', '')
 DB_PATH   = 'concerts.db'
 
-sheets = GoogleSheetsManager(
-    spreadsheet_id=SHEETS_ID if SHEETS_ID else None,
-    get_all_concerts_fn=lambda: db_all(include_cancelled=False),
-)
+sheets = GoogleSheetsManager(spreadsheet_id=SHEETS_ID if SHEETS_ID else None)
 
 KW = {
     'tickets': ['билеты', 'билет', 'ticket', 'tickets'],
@@ -363,13 +360,26 @@ def parse_trigger(text: str) -> Optional[dict]:
     payload = url or ''
 
     if action == 'text':
-        text_n = norm(text)
-        kw_n   = norm(found_kw)
-        idx    = text_n.find(kw_n)
-        if idx != -1:
-            after = text[idx + len(found_kw):].strip()
-            if after:
-                payload = after
+        # Ищем ключевое слово в оригинальном тексте (без нормализации)
+        found = False
+        for kw in KW['text']:
+            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+            m = pattern.search(text)
+            if m:
+                after = text[m.end():].strip()
+                if after:
+                    payload = after
+                    found = True
+                    break
+        # Если не нашли через прямой поиск — fallback на нормализованный
+        if not found:
+            text_n = norm(text)
+            kw_n   = norm(found_kw)
+            idx    = text_n.find(kw_n)
+            if idx != -1:
+                after = text[idx + len(found_kw):].strip()
+                if after:
+                    payload = after
 
     elif action == 'date':
         d, t    = extract_date_time(text)
@@ -571,7 +581,12 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif action == 'publish':
             c['status'] = 'published'
             db_save(c); sheets.sync_concert(c)
-            await q.edit_message_text(f"⚫ *{c['artist']}* — опубликован", parse_mode='Markdown')
+            slug = make_slug(c.get('artist', ''))
+            page_url = f"https://mtbarmoscow.com/{slug}"
+            await q.edit_message_text(
+                f"⚫ *{c['artist']}* — опубликован\n\n🔗 Ссылка для рекламы:\n{page_url}",
+                parse_mode='Markdown'
+            )
 
         elif action == 'delete':
             name = c['artist']
@@ -1036,6 +1051,15 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc       = c.get('description_text', '') or ''
 
     paragraphs = [p.strip() for p in desc.split('\n\n') if p.strip()]
+
+    # Определяем тип ссылки на билеты
+    is_ticketscloud = url.startswith('#ticketscloud')
+    if is_ticketscloud:
+        buy_btn_html = f'<a class="buy-btn" href="{url}">Купить билет</a>'
+        tc_script = '<script src="https://ticketscloud.com/static/scripts/widget/tcwidget.js"></script>'
+    else:
+        buy_btn_html = f'<button class="buy-btn" onclick="window.open(\'{url}\', \'_blank\')">Купить билет</button>'
+        tc_script = ''
     first_para = paragraphs[0] if paragraphs else desc
     rest_paras = '<br><br>'.join(paragraphs[1:]) if len(paragraphs) > 1 else ''
 
@@ -1055,9 +1079,7 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         <div class="event-datetime">{dt}</div>
 
         <div class="buttons-row">
-            <button class="buy-btn" onclick="window.open('{url}', '_blank')">
-                Купить билет
-            </button>
+            {buy_btn_html}
         </div>
 
         <div class="text-container" id="textContainer">
@@ -1121,8 +1143,8 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     .text-scroll-zone {{ position: relative; overflow: hidden; transition: max-height 0.5s ease; padding-bottom: 10px; }}
 
     @media (min-width: 961px) {{
-        .text-scroll-zone {{ max-height: 250px; }}
-        .text-scroll-zone.expanded {{ max-height: 2000px !important; }}
+        .text-scroll-zone {{ max-height: 260px; overflow: hidden; }}
+        .text-scroll-zone.expanded {{ max-height: 2000px !important; overflow: visible; }}
         .toggle-btn-wrapper {{ margin-top: auto; padding-top: 15px; display: none; }}
     }}
 
@@ -1190,9 +1212,13 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             const offset = contentTop - wrapperTop;
             const availableHeight = imgHeight - offset - 15;
 
-            zone.style.maxHeight = availableHeight + 'px';
+            // Снэпаем к целым строкам чтобы не резать по середине
+            const lineHeight = parseFloat(getComputedStyle(zone).lineHeight) || 25.6;
+            const snappedHeight = Math.floor(availableHeight / lineHeight) * lineHeight;
 
-            if (zone.scrollHeight > availableHeight + 20) {{
+            zone.style.maxHeight = snappedHeight + 'px';
+
+            if (zone.scrollHeight > snappedHeight + 20) {{
                 wrapper.style.display = 'flex';
             }} else {{
                 zone.style.maxHeight = 'none';
@@ -1205,7 +1231,8 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             }}
         }}
     }});
-</script>"""
+</script>
+{tc_script}"""
 
     m = missing(c)
     warnings = []
@@ -1229,15 +1256,19 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await upd.message.reply_document(document=bio, filename=fname)
 
     # Второе сообщение — SEO данные для Tilda
-    slug      = make_slug(artist, date_str)
+    slug      = make_slug(artist)  # без дат — только имя артиста
     seo_title = f"{artist} — праздничный концерт в Мумий Тролль Бар, Москва"
     seo_desc  = (
         f"Билеты на концерт {artist} в Мумий Тролль Бар, "
         f"музыкальный бар, ресторан с живой музыкой, "
         f"концертная площадка, Мумий Тролль Бар"
     )
+    # Заголовок для блока: дата • артист
+    header_line = f"{date_str} • {artist}" if date_str else artist
+
     seo_msg = (
         f"📋 *SEO для страницы*\n\n"
+        f"*Заголовок блока:*\n`{header_line}`\n\n"
         f"*Адрес страницы (slug):*\n`{slug}`\n\n"
         f"*SEO заголовок:*\n`{seo_title}`\n\n"
         f"*SEO описание:*\n`{seo_desc}`"
@@ -1360,14 +1391,6 @@ async def morning_digest(ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"digest {chat_id}: {e}")
 
 
-async def cmd_rebuild(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Пересобирает все календари в Google Sheets."""
-    msg = await upd.message.reply_text("⏳ Пересобираю календари...")
-    all_c = db_all()
-    sheets.rebuild_all_calendars(all_c)
-    await msg.edit_text(f"✅ Готово! Пересобрано для {len(all_c)} мероприятий.")
-
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1384,7 +1407,6 @@ def main():
         ('cancel',  cmd_cancel),
         ('digest',  cmd_digest),
         ('code',    cmd_code),
-        ('rebuild', cmd_rebuild),
         ('help',    cmd_start),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
