@@ -2,18 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Google Sheets Manager — MTB Concerts Bot
-Исправления:
+Исправления v2:
   - Credentials из переменной окружения GOOGLE_CREDENTIALS_JSON (JSON-строка)
   - Убран циклический импорт from bot import ...
-  - Стиль таблицы как в оригинальном xlsx (тёмный фон, жёлтые ссылки)
+  - get_all_concerts_fn: callback для получения всех концертов (фикс бага с календарём)
+  - Добавлена колонка Яндекс Музыка (L)
+  - Slug вычисляется на лету из artist + date
 """
 
 import os
+import re
 import json
 import logging
 import calendar
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +35,16 @@ SCOPES = [
 
 # ─── ЦВЕТА (RGB 0-1) ─────────────────────────────────────────────────────────
 
-C_BLACK      = {'red': 0.00, 'green': 0.00, 'blue': 0.00}   # фон нечётных строк
-C_DARKGRAY   = {'red': 0.26, 'green': 0.26, 'blue': 0.26}   # фон чётных строк
-C_HEADER     = {'red': 0.26, 'green': 0.26, 'blue': 0.26}   # фон заголовков
-C_TITLE_BG   = {'red': 0.00, 'green': 0.00, 'blue': 0.00}   # фон строки-заголовка
+C_BLACK      = {'red': 0.00, 'green': 0.00, 'blue': 0.00}
+C_DARKGRAY   = {'red': 0.26, 'green': 0.26, 'blue': 0.26}
+C_HEADER     = {'red': 0.26, 'green': 0.26, 'blue': 0.26}
+C_TITLE_BG   = {'red': 0.00, 'green': 0.00, 'blue': 0.00}
 C_WHITE      = {'red': 1.00, 'green': 1.00, 'blue': 1.00}
-C_LIGHT      = {'red': 0.95, 'green': 0.95, 'blue': 0.95}   # обычный текст
-C_YELLOW     = {'red': 0.96, 'green': 0.80, 'blue': 0.60}   # ссылки / заголовок
-C_GREEN_TEXT = {'red': 0.40, 'green': 0.86, 'blue': 0.50}   # статус готово
-C_RED_TEXT   = {'red': 0.96, 'green': 0.33, 'blue': 0.33}   # статус не готово
+C_LIGHT      = {'red': 0.95, 'green': 0.95, 'blue': 0.95}
+C_YELLOW     = {'red': 0.96, 'green': 0.80, 'blue': 0.60}
+C_GREEN_TEXT = {'red': 0.40, 'green': 0.86, 'blue': 0.50}
+C_RED_TEXT   = {'red': 0.96, 'green': 0.33, 'blue': 0.33}
 
-# Цвет фона ячейки по заполненности (для календаря)
 C_CAL_GREEN  = {'red': 0.20, 'green': 0.66, 'blue': 0.33}
 C_CAL_ORANGE = {'red': 0.98, 'green': 0.74, 'blue': 0.02}
 C_CAL_RED    = {'red': 0.96, 'green': 0.33, 'blue': 0.33}
@@ -52,6 +54,13 @@ WEEKDAYS_RU = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
 MONTHS_RU   = [
     '', 'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
     'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'
+]
+
+# Заголовки листа "Данные" — 12 колонок (A–L)
+DATA_HEADERS = [
+    'Сайт', 'Дата', 'Время', 'Страничка', 'Артист',
+    'Покупка билета', 'Картинка', 'Текст', 'Яндекс Музыка',
+    'Афиша', 'Статус', 'ID'
 ]
 
 # ─── ВСПОМОГАТЕЛЬНОЕ ─────────────────────────────────────────────────────────
@@ -81,20 +90,46 @@ def _col_letter(n: int) -> str:
         result = chr(65 + r) + result
     return result
 
-def _rgb(hex_str: str) -> Dict:
-    """'FF434343' → {red, green, blue}"""
-    h = hex_str.lstrip('#')
-    if len(h) == 8: h = h[2:]  # убрать alpha
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return {'red': r/255, 'green': g/255, 'blue': b/255}
+def _make_page_slug(artist: str) -> str:
+    """
+    Маша и Медведи → mashaimedvedi
+    Depeche Mode   → depechemode
+    Slug для URL страницы (без даты, без дефисов).
+    """
+    table = {
+        'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e',
+        'ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m',
+        'н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u',
+        'ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'sch',
+        'ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    }
+    result = ''
+    for ch in artist.lower():
+        if ch in table:
+            result += table[ch]
+        elif ch.isascii() and ch.isalpha():
+            result += ch
+        # пробелы и прочие символы — просто пропускаем
+    return result
+
 
 # ─── МЕНЕДЖЕР ────────────────────────────────────────────────────────────────
 
 class GoogleSheetsManager:
-    def __init__(self, spreadsheet_id: Optional[str] = None):
-        self.spreadsheet_id = spreadsheet_id
-        self.client         = None
-        self.spreadsheet    = None
+    def __init__(
+        self,
+        spreadsheet_id: Optional[str] = None,
+        get_all_concerts_fn: Optional[Callable[[], List[Dict]]] = None,
+    ):
+        """
+        get_all_concerts_fn — callback для получения всех концертов из БД.
+        Передаётся из bot.py чтобы избежать циклического импорта.
+        Нужен для корректной пересборки календаря.
+        """
+        self.spreadsheet_id       = spreadsheet_id
+        self.client               = None
+        self.spreadsheet          = None
+        self._get_all_concerts_fn = get_all_concerts_fn  # ✅ фикс бага с календарём
 
         if not GSPREAD_AVAILABLE:
             return
@@ -103,13 +138,11 @@ class GoogleSheetsManager:
             return
 
         try:
-            # ✅ Берём credentials из переменной окружения, не из файла
             creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
             if creds_json:
                 creds_info = json.loads(creds_json)
                 creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
             else:
-                # Фолбэк на файл если есть
                 creds_file = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
                 creds = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
 
@@ -128,12 +161,9 @@ class GoogleSheetsManager:
         try:
             return self.spreadsheet.worksheet('Данные')
         except Exception:
-            ws = self.spreadsheet.add_worksheet('Данные', rows=500, cols=11)
-            headers = [['Сайт', 'Дата', 'Время', 'Страничка', 'Артист',
-                        'Покупка билета', 'Картинка', 'Текст', 'Афиша', 'Статус', 'ID']]
-            ws.update('A1:K1', headers)
-            # Стиль заголовка — как в оригинале: тёмно-серый фон, белый жирный
-            ws.format('A1:K1', {
+            ws = self.spreadsheet.add_worksheet('Данные', rows=500, cols=12)
+            ws.update('A1:L1', [DATA_HEADERS])
+            ws.format('A1:L1', {
                 'backgroundColor': C_HEADER,
                 'textFormat': {
                     'bold': True,
@@ -142,7 +172,6 @@ class GoogleSheetsManager:
                 },
                 'horizontalAlignment': 'CENTER',
             })
-            # Заморозить первую строку
             try:
                 self.spreadsheet.batch_update({'requests': [{
                     'updateSheetProperties': {
@@ -173,34 +202,36 @@ class GoogleSheetsManager:
         all_values = ws.get_all_values()
         cid = str(concert.get('id', ''))
 
-        # Ищем строку по ID (последняя колонка)
+        # Ищем строку по ID (последняя колонка — L = 12)
         row_idx = None
         for i, row in enumerate(all_values[1:], start=2):
-            if len(row) >= 11 and row[10] == cid:
+            if len(row) >= 12 and row[11] == cid:
                 row_idx = i
                 break
 
-        date_str = concert.get('date', '') or ''
-        time_str = concert.get('time', '') or ''
-        slug     = concert.get('slug', '')
+        date_str   = concert.get('date', '') or ''
+        time_str   = concert.get('time', '') or ''
+        # ✅ Slug вычисляем из артиста (без даты — короткий URL для Tilda)
+        page_slug  = _make_page_slug(concert.get('artist', ''))
+        yandex_url = concert.get('yandex_music_url', '') or ''
 
         row_data = [[
-            '✅' if concert.get('status') != 'cancelled' else '🚫',
-            date_str,
-            time_str,
-            f"https://mtbarmoscow.com/{slug}" if slug else '',
-            concert.get('artist', ''),
-            concert.get('tickets_url', '') or '',
-            concert.get('poster_file_id', '') or '',
-            (concert.get('description_text', '') or '')[:200],
-            '✅' if concert.get('poster_status') == 'approved' else '❌',
-            _status_text(concert),
-            cid,
+            '✅' if concert.get('status') != 'cancelled' else '🚫',  # A Сайт
+            date_str,                                                  # B Дата
+            time_str,                                                  # C Время
+            f"https://mtbarmoscow.com/{page_slug}" if page_slug else '',  # D Страничка
+            concert.get('artist', ''),                                 # E Артист
+            concert.get('tickets_url', '') or '',                      # F Покупка билета
+            concert.get('poster_file_id', '') or '',                   # G Картинка
+            (concert.get('description_text', '') or '')[:200],         # H Текст
+            yandex_url,                                                # I Яндекс Музыка ✅ новое
+            '✅' if concert.get('poster_status') == 'approved' else '❌',  # J Афиша
+            _status_text(concert),                                     # K Статус
+            cid,                                                       # L ID
         ]]
 
-        # Чередование цветов строк
         if row_idx:
-            ws.update(f'A{row_idx}:K{row_idx}', row_data)
+            ws.update(f'A{row_idx}:L{row_idx}', row_data)
             bg = C_BLACK if row_idx % 2 == 0 else C_DARKGRAY
         else:
             ws.append_row(row_data[0])
@@ -208,23 +239,23 @@ class GoogleSheetsManager:
             bg = C_BLACK if row_idx % 2 == 0 else C_DARKGRAY
 
         # Базовый стиль строки
-        ws.format(f'A{row_idx}:K{row_idx}', {
+        ws.format(f'A{row_idx}:L{row_idx}', {
             'backgroundColor': bg,
             'textFormat': {'foregroundColor': C_LIGHT, 'fontSize': 9},
             'verticalAlignment': 'MIDDLE',
         })
 
-        # Ссылки жёлтым (колонки D, F, G — Страничка, Билеты, Картинка)
-        for col in ['D', 'F', 'G']:
+        # Ссылки жёлтым (D Страничка, F Билеты, G Картинка, I Яндекс Музыка)
+        for col in ['D', 'F', 'G', 'I']:
             ws.format(f'{col}{row_idx}', {
                 'backgroundColor': bg,
                 'textFormat': {'foregroundColor': C_YELLOW, 'fontSize': 9},
             })
 
         # Статус — цветной текст
-        status_ok = concert.get('poster_status') == 'approved' and \
-                    concert.get('tickets_url') and concert.get('description_text')
-        ws.format(f'J{row_idx}', {
+        status_ok = (concert.get('poster_status') == 'approved' and
+                     concert.get('tickets_url') and concert.get('description_text'))
+        ws.format(f'K{row_idx}', {
             'backgroundColor': bg,
             'textFormat': {
                 'foregroundColor': C_GREEN_TEXT if status_ok else C_RED_TEXT,
@@ -246,16 +277,28 @@ class GoogleSheetsManager:
             dt = datetime.strptime(concert['date'], '%d.%m.%Y')
         except Exception:
             return
-        self.rebuild_month_calendar(dt.month, dt.year)
+
+        # ✅ ФИКС: берём все концерты через callback вместо пустого списка
+        all_concerts: List[Dict] = []
+        if self._get_all_concerts_fn:
+            try:
+                all_concerts = self._get_all_concerts_fn()
+            except Exception as e:
+                logger.error(f"get_all_concerts_fn error: {e}")
+
+        self.rebuild_month_calendar(dt.month, dt.year, all_concerts)
 
     def rebuild_month_calendar(self, month: int, year: int, all_concerts: List[Dict] = None):
         """
         Перестраивает лист-календарь.
         all_concerts передаётся снаружи чтобы избежать циклического импорта.
+        Если не передан, используется callback _get_all_concerts_fn.
         """
         if not self._is_connected():
             return
         try:
+            if all_concerts is None and self._get_all_concerts_fn:
+                all_concerts = self._get_all_concerts_fn()
             ws = self._get_or_create_calendar_sheet(month, year)
             ws.clear()
             self._draw_calendar(ws, month, year, all_concerts or [])
@@ -265,7 +308,6 @@ class GoogleSheetsManager:
     def _draw_calendar(self, ws, month: int, year: int, all_concerts: List[Dict]):
         sheet_name = f"{MONTHS_RU[month]} {year}"
 
-        # Концерты по дням этого месяца
         concerts_by_day: Dict[int, List[Dict]] = {}
         for c in all_concerts:
             if not c.get('date'):
@@ -299,7 +341,6 @@ class GoogleSheetsManager:
             'horizontalAlignment': 'CENTER',
         })
 
-        # Сетка дней
         cal        = calendar.monthcalendar(year, month)
         batch      = []
         current_row = 3
@@ -338,19 +379,15 @@ class GoogleSheetsManager:
 
         ws.batch_update(batch)
 
-        # Форматирование через Sheets API
         sheet_id  = ws.id
         requests  = []
         current_row = 3
 
         for week in cal:
             for col_idx, day in enumerate(week):
-                if day == 0:
-                    current_row_unused = None
-                else:
+                if day != 0:
                     day_cs = concerts_by_day.get(day, [])
 
-                    # Номер дня
                     requests.append({'repeatCell': {
                         'range': {
                             'sheetId': sheet_id,
@@ -368,7 +405,6 @@ class GoogleSheetsManager:
                         'fields': 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
                     }})
 
-                    # Ячейки концертов
                     for i, c in enumerate(day_cs[:3]):
                         requests.append({'repeatCell': {
                             'range': {
@@ -417,7 +453,7 @@ class GoogleSheetsManager:
         if requests:
             self.spreadsheet.batch_update({'requests': requests})
 
-        logger.info(f"✅ Календарь '{sheet_name}' обновлён")
+        logger.info(f"✅ Календарь '{sheet_name}' обновлён ({len(all_concerts)} концертов)")
 
     def rebuild_all_calendars(self, all_concerts: List[Dict]):
         """Пересобирает все календари. Концерты передаются снаружи."""
