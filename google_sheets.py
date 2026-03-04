@@ -2,27 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Google Sheets Manager — MTB Concerts Bot
-Collector Mode v2
-
-Структура таблицы:
-  Лист "Данные"    — строки с концертами (для Dataview/фильтрации)
-  Лист "Март 2026" — визуальный календарь месяца (автосоздаётся)
-
-Календарь:
-  - Пн-Вс по колонкам
-  - Каждая ячейка даты: число + имя артиста + статус
-  - Цвет ячейки: зелёный / оранжевый / красный
+Исправления:
+  - Credentials из переменной окружения GOOGLE_CREDENTIALS_JSON (JSON-строка)
+  - Убран циклический импорт from bot import ...
+  - Стиль таблицы как в оригинальном xlsx (тёмный фон, жёлтые ссылки)
 """
 
 import os
+import json
 import logging
 import calendar
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# Попытка импорта gspread
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -36,15 +30,23 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive',
 ]
 
-CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
+# ─── ЦВЕТА (RGB 0-1) ─────────────────────────────────────────────────────────
 
-# Цвета для статусов (RGB 0-1)
-COLOR_GREEN  = {'red': 0.20, 'green': 0.66, 'blue': 0.33}   # 🟢 всё есть
-COLOR_ORANGE = {'red': 0.98, 'green': 0.74, 'blue': 0.02}   # 🟠 частично
-COLOR_RED    = {'red': 0.96, 'green': 0.33, 'blue': 0.33}   # 🔴 мало
-COLOR_WHITE  = {'red': 1.0,  'green': 1.0,  'blue': 1.0}
-COLOR_HEADER = {'red': 0.13, 'green': 0.13, 'blue': 0.13}   # почти чёрный
-COLOR_DATE_BG= {'red': 0.95, 'green': 0.95, 'blue': 0.95}   # светло-серый фон числа
+C_BLACK      = {'red': 0.00, 'green': 0.00, 'blue': 0.00}   # фон нечётных строк
+C_DARKGRAY   = {'red': 0.26, 'green': 0.26, 'blue': 0.26}   # фон чётных строк
+C_HEADER     = {'red': 0.26, 'green': 0.26, 'blue': 0.26}   # фон заголовков
+C_TITLE_BG   = {'red': 0.00, 'green': 0.00, 'blue': 0.00}   # фон строки-заголовка
+C_WHITE      = {'red': 1.00, 'green': 1.00, 'blue': 1.00}
+C_LIGHT      = {'red': 0.95, 'green': 0.95, 'blue': 0.95}   # обычный текст
+C_YELLOW     = {'red': 0.96, 'green': 0.80, 'blue': 0.60}   # ссылки / заголовок
+C_GREEN_TEXT = {'red': 0.40, 'green': 0.86, 'blue': 0.50}   # статус готово
+C_RED_TEXT   = {'red': 0.96, 'green': 0.33, 'blue': 0.33}   # статус не готово
+
+# Цвет фона ячейки по заполненности (для календаря)
+C_CAL_GREEN  = {'red': 0.20, 'green': 0.66, 'blue': 0.33}
+C_CAL_ORANGE = {'red': 0.98, 'green': 0.74, 'blue': 0.02}
+C_CAL_RED    = {'red': 0.96, 'green': 0.33, 'blue': 0.33}
+C_CAL_DATE   = {'red': 0.95, 'green': 0.95, 'blue': 0.95}
 
 WEEKDAYS_RU = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
 MONTHS_RU   = [
@@ -52,44 +54,41 @@ MONTHS_RU   = [
     'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'
 ]
 
+# ─── ВСПОМОГАТЕЛЬНОЕ ─────────────────────────────────────────────────────────
 
-def _concert_status_color(concert: Dict) -> Dict:
-    """Возвращает цвет по статусу концерта."""
-    has_poster  = concert.get('poster_status') == 'approved'
-    has_tickets = bool(concert.get('tickets_url'))
-    has_desc    = bool(concert.get('description_text'))
-    has_date    = bool(concert.get('date'))
+def _status_color_cal(c: Dict) -> Dict:
+    filled = sum([
+        c.get('poster_status') == 'approved',
+        bool(c.get('tickets_url')),
+        bool(c.get('description_text')),
+        bool(c.get('date')),
+    ])
+    if filled == 4: return C_CAL_GREEN
+    if filled >= 2: return C_CAL_ORANGE
+    return C_CAL_RED
 
-    filled = sum([has_poster, has_tickets, has_desc, has_date])
-
-    if filled == 4:
-        return COLOR_GREEN
-    elif filled >= 2:
-        return COLOR_ORANGE
-    else:
-        return COLOR_RED
-
-
-def _concert_status_text(concert: Dict) -> str:
-    """Короткая строка статуса для ячейки."""
-    parts = []
-    if concert.get('poster_status') != 'approved': parts.append('афиша')
-    if not concert.get('tickets_url'):              parts.append('билеты')
-    if not concert.get('description_text'):         parts.append('текст')
-
-    if not parts:
-        return '✅ Готово'
-    return '❌ Нет: ' + ', '.join(parts)
-
+def _status_text(c: Dict) -> str:
+    missing = []
+    if c.get('poster_status') != 'approved': missing.append('афиша')
+    if not c.get('tickets_url'):             missing.append('билеты')
+    if not c.get('description_text'):        missing.append('текст')
+    return '✅ Готово' if not missing else '❌ ' + ', '.join(missing)
 
 def _col_letter(n: int) -> str:
-    """Номер колонки → буква (1=A, 2=B, ...)"""
     result = ''
     while n > 0:
         n, r = divmod(n - 1, 26)
         result = chr(65 + r) + result
     return result
 
+def _rgb(hex_str: str) -> Dict:
+    """'FF434343' → {red, green, blue}"""
+    h = hex_str.lstrip('#')
+    if len(h) == 8: h = h[2:]  # убрать alpha
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return {'red': r/255, 'green': g/255, 'blue': b/255}
+
+# ─── МЕНЕДЖЕР ────────────────────────────────────────────────────────────────
 
 class GoogleSheetsManager:
     def __init__(self, spreadsheet_id: Optional[str] = None):
@@ -104,36 +103,62 @@ class GoogleSheetsManager:
             return
 
         try:
-            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+            # ✅ Берём credentials из переменной окружения, не из файла
+            creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+            if creds_json:
+                creds_info = json.loads(creds_json)
+                creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+            else:
+                # Фолбэк на файл если есть
+                creds_file = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
+                creds = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+
             self.client      = gspread.authorize(creds)
             self.spreadsheet = self.client.open_by_key(spreadsheet_id)
-            logger.info("Google Sheets подключён")
+            logger.info("✅ Google Sheets подключён")
         except Exception as e:
             logger.error(f"Google Sheets init error: {e}")
 
     def _is_connected(self) -> bool:
         return self.client is not None and self.spreadsheet is not None
 
-    # ==================== ЛИСТ "ДАННЫЕ" ====================
+    # ── ЛИСТ "ДАННЫЕ" ────────────────────────────────────────────────────────
 
     def _get_or_create_data_sheet(self):
-        """Получает или создаёт лист 'Данные'."""
         try:
             return self.spreadsheet.worksheet('Данные')
-        except gspread.WorksheetNotFound:
-            ws = self.spreadsheet.add_worksheet('Данные', rows=500, cols=10)
-            # Заголовки
-            headers = ['Дата', 'Артист', 'Город', 'Афиша', 'Билеты', 'Текст', 'Статус', 'ID']
-            ws.update('A1:H1', [headers])
-            ws.format('A1:H1', {
-                'backgroundColor': COLOR_HEADER,
-                'textFormat': {'bold': True, 'foregroundColor': COLOR_WHITE},
+        except Exception:
+            ws = self.spreadsheet.add_worksheet('Данные', rows=500, cols=11)
+            headers = [['Сайт', 'Дата', 'Время', 'Страничка', 'Артист',
+                        'Покупка билета', 'Картинка', 'Текст', 'Афиша', 'Статус', 'ID']]
+            ws.update('A1:K1', headers)
+            # Стиль заголовка — как в оригинале: тёмно-серый фон, белый жирный
+            ws.format('A1:K1', {
+                'backgroundColor': C_HEADER,
+                'textFormat': {
+                    'bold': True,
+                    'foregroundColor': C_WHITE,
+                    'fontSize': 10,
+                },
                 'horizontalAlignment': 'CENTER',
             })
+            # Заморозить первую строку
+            try:
+                self.spreadsheet.batch_update({'requests': [{
+                    'updateSheetProperties': {
+                        'properties': {
+                            'sheetId': ws.id,
+                            'gridProperties': {'frozenRowCount': 1}
+                        },
+                        'fields': 'gridProperties.frozenRowCount'
+                    }
+                }]})
+            except Exception:
+                pass
             return ws
 
     def sync_concert(self, concert: Dict):
-        """Обновляет строку концерта в листе 'Данные' и пересоздаёт календарь."""
+        """Обновляет строку в листе Данные + пересобирает календарь месяца."""
         if not self._is_connected():
             return
         try:
@@ -148,111 +173,99 @@ class GoogleSheetsManager:
         all_values = ws.get_all_values()
         cid = str(concert.get('id', ''))
 
-        # Ищем существующую строку по ID
+        # Ищем строку по ID (последняя колонка)
         row_idx = None
         for i, row in enumerate(all_values[1:], start=2):
-            if len(row) >= 8 and row[7] == cid:
+            if len(row) >= 11 and row[10] == cid:
                 row_idx = i
                 break
 
-        poster_val  = '✅' if concert.get('poster_status') == 'approved' else '❌'
-        tickets_val = '✅' if concert.get('tickets_url') else '❌'
-        desc_val    = '✅' if concert.get('description_text') else '❌'
-        status_val  = _concert_status_text(concert)
+        date_str = concert.get('date', '') or ''
+        time_str = concert.get('time', '') or ''
+        slug     = concert.get('slug', '')
 
-        row_data = [
-            concert.get('date', '—'),
+        row_data = [[
+            '✅' if concert.get('status') != 'cancelled' else '🚫',
+            date_str,
+            time_str,
+            f"https://mtbarmoscow.com/{slug}" if slug else '',
             concert.get('artist', ''),
-            concert.get('city', ''),
-            poster_val,
-            tickets_val,
-            desc_val,
-            status_val,
+            concert.get('tickets_url', '') or '',
+            concert.get('poster_file_id', '') or '',
+            (concert.get('description_text', '') or '')[:200],
+            '✅' if concert.get('poster_status') == 'approved' else '❌',
+            _status_text(concert),
             cid,
-        ]
+        ]]
 
-        color = _concert_status_color(concert)
-
+        # Чередование цветов строк
         if row_idx:
-            ws.update(f'A{row_idx}:H{row_idx}', [row_data])
+            ws.update(f'A{row_idx}:K{row_idx}', row_data)
+            bg = C_BLACK if row_idx % 2 == 0 else C_DARKGRAY
         else:
-            ws.append_row(row_data)
+            ws.append_row(row_data[0])
             row_idx = len(ws.get_all_values())
+            bg = C_BLACK if row_idx % 2 == 0 else C_DARKGRAY
 
-        # Красим строку
-        ws.format(f'A{row_idx}:H{row_idx}', {
-            'backgroundColor': color,
-            'horizontalAlignment': 'CENTER',
+        # Базовый стиль строки
+        ws.format(f'A{row_idx}:K{row_idx}', {
+            'backgroundColor': bg,
+            'textFormat': {'foregroundColor': C_LIGHT, 'fontSize': 9},
+            'verticalAlignment': 'MIDDLE',
         })
 
-    # ==================== КАЛЕНДАРЬ ====================
+        # Ссылки жёлтым (колонки D, F, G — Страничка, Билеты, Картинка)
+        for col in ['D', 'F', 'G']:
+            ws.format(f'{col}{row_idx}', {
+                'backgroundColor': bg,
+                'textFormat': {'foregroundColor': C_YELLOW, 'fontSize': 9},
+            })
+
+        # Статус — цветной текст
+        status_ok = concert.get('poster_status') == 'approved' and \
+                    concert.get('tickets_url') and concert.get('description_text')
+        ws.format(f'J{row_idx}', {
+            'backgroundColor': bg,
+            'textFormat': {
+                'foregroundColor': C_GREEN_TEXT if status_ok else C_RED_TEXT,
+                'fontSize': 9,
+            },
+        })
+
+    # ── CALENDAR ─────────────────────────────────────────────────────────────
 
     def _get_or_create_calendar_sheet(self, month: int, year: int):
-        """Получает или создаёт лист-календарь для месяца."""
         sheet_name = f"{MONTHS_RU[month]} {year}"
         try:
-            ws = self.spreadsheet.worksheet(sheet_name)
-            return ws
-        except gspread.WorksheetNotFound:
-            # Создаём новый лист — 40 строк, 7 колонок
-            ws = self.spreadsheet.add_worksheet(sheet_name, rows=40, cols=7)
-            return ws
+            return self.spreadsheet.worksheet(sheet_name)
+        except Exception:
+            return self.spreadsheet.add_worksheet(sheet_name, rows=50, cols=7)
 
     def _rebuild_calendar_for_concert(self, concert: Dict):
-        """Перестраивает календарный лист для месяца концерта."""
         try:
             dt = datetime.strptime(concert['date'], '%d.%m.%Y')
-        except:
+        except Exception:
             return
         self.rebuild_month_calendar(dt.month, dt.year)
 
-    def rebuild_month_calendar(self, month: int, year: int):
+    def rebuild_month_calendar(self, month: int, year: int, all_concerts: List[Dict] = None):
         """
-        Полностью перестраивает календарь месяца.
-        Вызывается после любого изменения концерта.
+        Перестраивает лист-календарь.
+        all_concerts передаётся снаружи чтобы избежать циклического импорта.
         """
         if not self._is_connected():
             return
         try:
             ws = self._get_or_create_calendar_sheet(month, year)
             ws.clear()
-            self._draw_calendar(ws, month, year)
+            self._draw_calendar(ws, month, year, all_concerts or [])
         except Exception as e:
             logger.error(f"rebuild_month_calendar error: {e}")
 
-    def _draw_calendar(self, ws, month: int, year: int):
-        """Рисует календарную сетку и вставляет концерты."""
-        from gspread.utils import rowcol_to_a1
-
+    def _draw_calendar(self, ws, month: int, year: int, all_concerts: List[Dict]):
         sheet_name = f"{MONTHS_RU[month]} {year}"
 
-        # --- Заголовок месяца ---
-        ws.merge_cells('A1:G1')
-        ws.update('A1', [[f"{MONTHS_RU[month].upper()} {year}"]])
-        ws.format('A1:G1', {
-            'backgroundColor': COLOR_HEADER,
-            'textFormat': {
-                'bold': True,
-                'fontSize': 14,
-                'foregroundColor': COLOR_WHITE,
-            },
-            'horizontalAlignment': 'CENTER',
-            'verticalAlignment': 'MIDDLE',
-        })
-
-        # --- Дни недели ---
-        ws.update('A2:G2', [WEEKDAYS_RU])
-        ws.format('A2:G2', {
-            'backgroundColor': {'red': 0.25, 'green': 0.25, 'blue': 0.25},
-            'textFormat': {'bold': True, 'foregroundColor': COLOR_WHITE},
-            'horizontalAlignment': 'CENTER',
-        })
-
-        # --- Получаем все концерты этого месяца ---
-        # Импортируем здесь чтобы избежать циклического импорта
-        from bot import get_all_concerts
-        all_concerts = get_all_concerts()
-
+        # Концерты по дням этого месяца
         concerts_by_day: Dict[int, List[Dict]] = {}
         for c in all_concerts:
             if not c.get('date'):
@@ -260,205 +273,170 @@ class GoogleSheetsManager:
             try:
                 dt = datetime.strptime(c['date'], '%d.%m.%Y')
                 if dt.month == month and dt.year == year:
-                    day = dt.day
-                    if day not in concerts_by_day:
-                        concerts_by_day[day] = []
-                    concerts_by_day[day].append(c)
-            except:
+                    concerts_by_day.setdefault(dt.day, []).append(c)
+            except Exception:
                 pass
 
-        # --- Рисуем сетку дней ---
-        cal = calendar.monthcalendar(year, month)
-        # cal — список недель, каждая неделя = [пн, вт, ср, чт, пт, сб, вс]
-        # 0 = день не принадлежит этому месяцу
+        # Строка 1 — заголовок месяца
+        ws.merge_cells('A1:G1')
+        ws.update('A1', [[f"АФИША МЕРОПРИЯТИЙ — {MONTHS_RU[month].upper()} {year}"]])
+        ws.format('A1:G1', {
+            'backgroundColor': C_TITLE_BG,
+            'textFormat': {
+                'bold': True,
+                'fontSize': 16,
+                'foregroundColor': C_YELLOW,
+            },
+            'horizontalAlignment': 'CENTER',
+            'verticalAlignment': 'MIDDLE',
+        })
 
-        batch_updates = []   # для массового обновления ячеек
-        format_requests = [] # для форматирования через batchUpdate API
+        # Строка 2 — дни недели
+        ws.update('A2:G2', [WEEKDAYS_RU])
+        ws.format('A2:G2', {
+            'backgroundColor': C_HEADER,
+            'textFormat': {'bold': True, 'foregroundColor': C_WHITE, 'fontSize': 11},
+            'horizontalAlignment': 'CENTER',
+        })
 
-        current_row = 3  # строки 1=заголовок, 2=дни недели, с 3й начинаем недели
+        # Сетка дней
+        cal        = calendar.monthcalendar(year, month)
+        batch      = []
+        current_row = 3
 
         for week in cal:
-            # Каждая неделя занимает 4 строки:
-            # строка 1 — номер дня
-            # строки 2-4 — содержимое (концерты)
-            day_row   = current_row
-            info_rows = [current_row + 1, current_row + 2, current_row + 3]
+            row_days  = []
+            row_info1 = []
+            row_info2 = []
+            row_info3 = []
 
-            row_day_values   = []
-            row_info1_values = []
-            row_info2_values = []
-            row_info3_values = []
-
-            for col_idx, day in enumerate(week):
-                col_letter = _col_letter(col_idx + 1)
-
+            for day in week:
                 if day == 0:
-                    row_day_values.append('')
-                    row_info1_values.append('')
-                    row_info2_values.append('')
-                    row_info3_values.append('')
+                    row_days.append('')
+                    row_info1.append('')
+                    row_info2.append('')
+                    row_info3.append('')
                 else:
-                    row_day_values.append(str(day))
-                    day_concerts = concerts_by_day.get(day, [])
+                    row_days.append(str(day))
+                    day_cs = concerts_by_day.get(day, [])
+                    info   = ['', '', '']
+                    for i, c in enumerate(day_cs[:3]):
+                        t = f" {c['time']}" if c.get('time') else ''
+                        info[i] = f"{c.get('artist','')}{t}\n{_status_text(c)}"
+                    row_info1.append(info[0])
+                    row_info2.append(info[1])
+                    row_info3.append(info[2])
 
-                    if not day_concerts:
-                        row_info1_values.append('')
-                        row_info2_values.append('')
-                        row_info3_values.append('')
-                    else:
-                        # Вставляем до 3 концертов в день
-                        info_lines = ['', '', '']
-                        for i, c in enumerate(day_concerts[:3]):
-                            time_str = f" {c['time']}" if c.get('time') else ''
-                            artist   = c.get('artist', '')
-                            status   = _concert_status_text(c)
-                            info_lines[i] = f"{artist}{time_str}\n{status}"
-
-                        row_info1_values.append(info_lines[0])
-                        row_info2_values.append(info_lines[1])
-                        row_info3_values.append(info_lines[2])
-
-            # Записываем строки
-            a1_day   = f'A{day_row}:G{day_row}'
-            a1_info1 = f'A{info_rows[0]}:G{info_rows[0]}'
-            a1_info2 = f'A{info_rows[1]}:G{info_rows[1]}'
-            a1_info3 = f'A{info_rows[2]}:G{info_rows[2]}'
-
-            batch_updates.extend([
-                {'range': a1_day,   'values': [row_day_values]},
-                {'range': a1_info1, 'values': [row_info1_values]},
-                {'range': a1_info2, 'values': [row_info2_values]},
-                {'range': a1_info3, 'values': [row_info3_values]},
-            ])
-
+            r = current_row
+            batch += [
+                {'range': f'A{r}:G{r}',     'values': [row_days]},
+                {'range': f'A{r+1}:G{r+1}', 'values': [row_info1]},
+                {'range': f'A{r+2}:G{r+2}', 'values': [row_info2]},
+                {'range': f'A{r+3}:G{r+3}', 'values': [row_info3]},
+            ]
             current_row += 4
 
-        # Массово записываем все данные
-        ws.batch_update(batch_updates)
+        ws.batch_update(batch)
 
-        # --- Форматирование через Sheets API ---
-        spreadsheet_id = self.spreadsheet.id
-        requests = []
-
-        sheet_id = ws.id
+        # Форматирование через Sheets API
+        sheet_id  = ws.id
+        requests  = []
         current_row = 3
 
         for week in cal:
             for col_idx, day in enumerate(week):
                 if day == 0:
-                    current_row_in_loop = None
+                    current_row_unused = None
                 else:
-                    day_concerts = concerts_by_day.get(day, [])
+                    day_cs = concerts_by_day.get(day, [])
 
-                    # Номер дня — серый фон
-                    requests.append({
-                        'repeatCell': {
+                    # Номер дня
+                    requests.append({'repeatCell': {
+                        'range': {
+                            'sheetId': sheet_id,
+                            'startRowIndex': current_row - 1,
+                            'endRowIndex': current_row,
+                            'startColumnIndex': col_idx,
+                            'endColumnIndex': col_idx + 1,
+                        },
+                        'cell': {'userEnteredFormat': {
+                            'backgroundColor': C_CAL_DATE,
+                            'textFormat': {'bold': True, 'fontSize': 11},
+                            'horizontalAlignment': 'LEFT',
+                            'verticalAlignment': 'MIDDLE',
+                        }},
+                        'fields': 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
+                    }})
+
+                    # Ячейки концертов
+                    for i, c in enumerate(day_cs[:3]):
+                        requests.append({'repeatCell': {
                             'range': {
                                 'sheetId': sheet_id,
-                                'startRowIndex': current_row - 1,
-                                'endRowIndex': current_row,
+                                'startRowIndex': current_row + i,
+                                'endRowIndex': current_row + i + 1,
                                 'startColumnIndex': col_idx,
                                 'endColumnIndex': col_idx + 1,
                             },
-                            'cell': {
-                                'userEnteredFormat': {
-                                    'backgroundColor': COLOR_DATE_BG,
-                                    'textFormat': {'bold': True, 'fontSize': 11},
-                                    'horizontalAlignment': 'LEFT',
-                                    'verticalAlignment': 'MIDDLE',
-                                }
-                            },
-                            'fields': 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)',
-                        }
-                    })
-
-                    # Ячейки с концертами — цвет статуса
-                    if day_concerts:
-                        for i, c in enumerate(day_concerts[:3]):
-                            color = _concert_status_color(c)
-                            requests.append({
-                                'repeatCell': {
-                                    'range': {
-                                        'sheetId': sheet_id,
-                                        'startRowIndex': current_row + i,
-                                        'endRowIndex': current_row + i + 1,
-                                        'startColumnIndex': col_idx,
-                                        'endColumnIndex': col_idx + 1,
-                                    },
-                                    'cell': {
-                                        'userEnteredFormat': {
-                                            'backgroundColor': color,
-                                            'textFormat': {'fontSize': 9},
-                                            'wrapStrategy': 'WRAP',
-                                            'verticalAlignment': 'TOP',
-                                        }
-                                    },
-                                    'fields': 'userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)',
-                                }
-                            })
+                            'cell': {'userEnteredFormat': {
+                                'backgroundColor': _status_color_cal(c),
+                                'textFormat': {'fontSize': 9, 'foregroundColor': C_BLACK},
+                                'wrapStrategy': 'WRAP',
+                                'verticalAlignment': 'TOP',
+                            }},
+                            'fields': 'userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)',
+                        }})
 
             current_row += 4
 
-        # Высота строк — большие для ячеек с концертами
-        row_heights = []
+        # Высоты строк
         r = 3
         for _ in cal:
-            row_heights.append({'index': r - 1,     'pixelSize': 22})   # число дня
-            row_heights.append({'index': r,         'pixelSize': 52})   # концерт 1
-            row_heights.append({'index': r + 1,     'pixelSize': 52})   # концерт 2
-            row_heights.append({'index': r + 2,     'pixelSize': 52})   # концерт 3
+            requests += [
+                {'updateDimensionProperties': {'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r-1, 'endIndex': r},   'properties': {'pixelSize': 22}, 'fields': 'pixelSize'}},
+                {'updateDimensionProperties': {'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r,   'endIndex': r+1}, 'properties': {'pixelSize': 55}, 'fields': 'pixelSize'}},
+                {'updateDimensionProperties': {'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r+1, 'endIndex': r+2}, 'properties': {'pixelSize': 55}, 'fields': 'pixelSize'}},
+                {'updateDimensionProperties': {'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': r+2, 'endIndex': r+3}, 'properties': {'pixelSize': 55}, 'fields': 'pixelSize'}},
+            ]
             r += 4
 
-        for rh in row_heights:
-            requests.append({
-                'updateDimensionProperties': {
-                    'range': {
-                        'sheetId': sheet_id,
-                        'dimension': 'ROWS',
-                        'startIndex': rh['index'],
-                        'endIndex': rh['index'] + 1,
-                    },
-                    'properties': {'pixelSize': rh['pixelSize']},
-                    'fields': 'pixelSize',
-                }
-            })
+        # Ширина колонок
+        requests.append({'updateDimensionProperties': {
+            'range': {'sheetId': sheet_id, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 7},
+            'properties': {'pixelSize': 170},
+            'fields': 'pixelSize',
+        }})
 
-        # Ширина колонок — одинаковая
-        requests.append({
-            'updateDimensionProperties': {
-                'range': {
-                    'sheetId': sheet_id,
-                    'dimension': 'COLUMNS',
-                    'startIndex': 0,
-                    'endIndex': 7,
-                },
-                'properties': {'pixelSize': 160},
-                'fields': 'pixelSize',
-            }
-        })
+        # Строка 1 — высота заголовка
+        requests.append({'updateDimensionProperties': {
+            'range': {'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 1},
+            'properties': {'pixelSize': 45},
+            'fields': 'pixelSize',
+        }})
 
-        # Отправляем все форматирования одним запросом
         if requests:
             self.spreadsheet.batch_update({'requests': requests})
 
-        logger.info(f"Календарь '{sheet_name}' обновлён")
+        logger.info(f"✅ Календарь '{sheet_name}' обновлён")
 
-    def rebuild_all_calendars(self):
-        """Пересобирает все календари по текущим данным из БД."""
+    def rebuild_all_calendars(self, all_concerts: List[Dict]):
+        """Пересобирает все календари. Концерты передаются снаружи."""
         if not self._is_connected():
             return
         try:
-            from bot import get_all_concerts
-            concerts = get_all_concerts()
-            months_to_rebuild = set()
-            for c in concerts:
+            months = set()
+            for c in all_concerts:
                 if c.get('date'):
                     try:
                         dt = datetime.strptime(c['date'], '%d.%m.%Y')
-                        months_to_rebuild.add((dt.month, dt.year))
-                    except:
+                        months.add((dt.month, dt.year))
+                    except Exception:
                         pass
-            for month, year in months_to_rebuild:
-                self.rebuild_month_calendar(month, year)
+            for month, year in months:
+                month_concerts = [
+                    c for c in all_concerts
+                    if c.get('date') and datetime.strptime(c['date'], '%d.%m.%Y').month == month
+                ]
+                self.rebuild_month_calendar(month, year, month_concerts)
         except Exception as e:
             logger.error(f"rebuild_all_calendars error: {e}")
