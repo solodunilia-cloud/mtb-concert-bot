@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTB Concerts Bot — v5
-Все правки из чеклиста:
-1. /new — любой порядок слов, предлагает создать если имя+дата без команды
-2. /edit [номер] — редактирует конкретное, без номера — список
-3. Защита от дублей при создании
-4. /list afisha/tickets/text — фильтры по отсутствующим полям
-5. /list 2026-04 — по месяцам
-6. После даты без времени — спрашивает время
+MTB Concerts Bot — v6
+Google Sheets = единственная база данных. SQLite убран полностью.
+При старте бот читает все концерты из Sheets в память.
+При любом изменении — пишет в Sheets и обновляет память.
 """
 
 import os
 import re
 import logging
-import sqlite3
 from datetime import datetime, time as dtime
 from typing import Optional, Dict, List, Tuple
 
@@ -34,7 +29,6 @@ logger = logging.getLogger(__name__)
 TOKEN     = os.getenv('TELEGRAM_TOKEN', '')
 OWNER_ID  = int(os.getenv('OWNER_ID', '534303997'))
 SHEETS_ID = os.getenv('GOOGLE_SHEETS_ID', '')
-DB_PATH   = 'concerts.db'
 
 sheets = GoogleSheetsManager(spreadsheet_id=SHEETS_ID if SHEETS_ID else None)
 
@@ -47,73 +41,65 @@ KW = {
 }
 POSTER_OK = ['одобрена', 'ок', 'ok', 'утверждена', 'готова', 'approved']
 
-# ─── БАЗА ДАННЫХ ──────────────────────────────────────────────────────────────
+# ─── IN-MEMORY ХРАНИЛИЩЕ ──────────────────────────────────────────────────────
+# Загружается из Google Sheets при старте. Sheets = источник правды.
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS concerts (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            artist           TEXT NOT NULL,
-            date             TEXT,
-            time             TEXT,
-            poster_status    TEXT DEFAULT 'none',
-            poster_file_id   TEXT,
-            tickets_url      TEXT,
-            description_text TEXT,
-            status           TEXT DEFAULT 'draft',
-            created_at       TEXT DEFAULT (datetime('now')),
-            updated_at       TEXT DEFAULT (datetime('now'))
-        )''')
-        conn.execute('CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)')
+_concerts: List[dict] = []   # все концерты
+_chats:    List[int]  = []   # зарегистрированные chat_id
 
-def db_save(data: dict) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        now = datetime.now().isoformat()
-        if data.get('id'):
-            conn.execute('''UPDATE concerts SET
-                artist=?, date=?, time=?, poster_status=?, poster_file_id=?,
-                tickets_url=?, description_text=?, status=?, updated_at=?
-                WHERE id=?''', (
-                data.get('artist'), data.get('date'), data.get('time'),
-                data.get('poster_status', 'none'), data.get('poster_file_id'),
-                data.get('tickets_url'), data.get('description_text'),
-                data.get('status', 'draft'), now, data['id']
-            ))
-            return data['id']
-        else:
-            cur = conn.execute('''INSERT INTO concerts
-                (artist, date, time, poster_status, tickets_url, description_text, status)
-                VALUES (?,?,?,?,?,?,?)''', (
-                data.get('artist'), data.get('date'), data.get('time'),
-                data.get('poster_status', 'none'), data.get('tickets_url'),
-                data.get('description_text'), data.get('status', 'draft')
-            ))
-            return cur.lastrowid
+def _concerts_sorted(include_cancelled=False) -> List[dict]:
+    items = _concerts if include_cancelled else [c for c in _concerts if c.get('status') != 'cancelled']
+    return sorted(items, key=lambda c: (c.get('date') or '9999', -c.get('id', 0)))
 
 def db_get(cid: int) -> Optional[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute('SELECT * FROM concerts WHERE id=?', (cid,)).fetchone()
-        return dict(row) if row else None
+    for c in _concerts:
+        if c.get('id') == cid:
+            return c
+    return None
 
 def db_all(include_cancelled=False) -> List[dict]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        q = 'SELECT * FROM concerts ORDER BY date ASC, id DESC' if include_cancelled else \
-            "SELECT * FROM concerts WHERE status != 'cancelled' ORDER BY date ASC, id DESC"
-        return [dict(r) for r in conn.execute(q).fetchall()]
+    return _concerts_sorted(include_cancelled)
+
+def db_save(data: dict) -> int:
+    """Создаёт или обновляет концерт в памяти. Запись в Sheets — отдельно через sheets.sync_concert."""
+    if data.get('id'):
+        existing = db_get(data['id'])
+        if existing:
+            existing.update({k: v for k, v in data.items() if k != '_row'})
+            return data['id']
+    # Новый концерт
+    new_id = sheets.next_id(_concerts) if sheets.is_connected() else (max((c['id'] for c in _concerts), default=0) + 1)
+    new_c  = {
+        'id':               new_id,
+        'artist':           data.get('artist', ''),
+        'date':             data.get('date'),
+        'time':             data.get('time'),
+        'poster_status':    data.get('poster_status', 'none'),
+        'poster_file_id':   data.get('poster_file_id'),
+        'tickets_url':      data.get('tickets_url'),
+        'description_text': data.get('description_text'),
+        'status':           data.get('status', 'draft'),
+        'created_at':       datetime.now().isoformat(),
+        'updated_at':       datetime.now().isoformat(),
+        '_row':             None,
+    }
+    _concerts.append(new_c)
+    return new_id
 
 def db_delete(cid: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('DELETE FROM concerts WHERE id=?', (cid,))
+    global _concerts
+    c = db_get(cid)
+    if c:
+        sheets.delete_concert(c, _concerts)
+        _concerts = [x for x in _concerts if x.get('id') != cid]
 
 def register_chat(chat_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('INSERT OR IGNORE INTO chats (chat_id) VALUES (?)', (chat_id,))
+    if chat_id not in _chats:
+        _chats.append(chat_id)
+        sheets.save_chat(chat_id, _chats)
 
 def get_chats() -> List[int]:
-    with sqlite3.connect(DB_PATH) as conn:
-        return [r[0] for r in conn.execute('SELECT chat_id FROM chats').fetchall()]
+    return list(_chats)
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ──────────────────────────────────────────────────
 
@@ -360,19 +346,20 @@ def parse_trigger(text: str) -> Optional[dict]:
     payload = url or ''
 
     if action == 'text':
-        # Ищем ключевое слово в оригинальном тексте (без нормализации)
-        found = False
+        # Артист — всё ДО ключевого слова, текст — всё ПОСЛЕ
         for kw in KW['text']:
             pattern = re.compile(re.escape(kw), re.IGNORECASE)
             m = pattern.search(text)
             if m:
-                after = text[m.end():].strip()
+                after  = text[m.end():].strip()
+                before = text[:m.start()].strip()
                 if after:
                     payload = after
-                    found = True
+                    if before and len(before) >= 2:
+                        artist = re.sub(r'\s+', ' ', before).strip()
                     break
-        # Если не нашли через прямой поиск — fallback на нормализованный
-        if not found:
+        # fallback
+        if not payload:
             text_n = norm(text)
             kw_n   = norm(found_kw)
             idx    = text_n.find(kw_n)
@@ -380,6 +367,17 @@ def parse_trigger(text: str) -> Optional[dict]:
                 after = text[idx + len(found_kw):].strip()
                 if after:
                     payload = after
+
+    elif action == 'tickets':
+        # Артист — всё ДО ключевого слова (без URL)
+        for kw in KW['tickets']:
+            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+            m = pattern.search(text)
+            if m:
+                before = re.sub(r'https?://\S+', '', text[:m.start()]).strip()
+                if before and len(before) >= 2:
+                    artist = re.sub(r'\s+', ' ', before).strip()
+                break
 
     elif action == 'date':
         d, t    = extract_date_time(text)
@@ -522,6 +520,7 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, name, action, payload = data.split('|', 3)
         cid = db_save({'artist': name})
         c   = db_get(cid)
+        sheets.sync_concert(c, _concerts)
         await q.edit_message_text(f"✅ Создано: *#{cid} {name}*", parse_mode='Markdown')
         await apply_action(upd, ctx, c, action, payload)
         return
@@ -545,13 +544,13 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             url = ctx.user_data.pop(f'v_{cid}', None)
             if url:
                 c['tickets_url'] = url
-                db_save(c); sheets.sync_concert(c)
+                db_save(c); sheets.sync_concert(c, _concerts)
                 await notify_ready(ctx, c)
                 await q.edit_message_text(f"✅ Билеты добавлены — *{c['artist']}*", parse_mode='Markdown')
 
         elif action == 'poster':
             c['poster_status'] = 'approved'
-            db_save(c); sheets.sync_concert(c)
+            db_save(c); sheets.sync_concert(c, _concerts)
             await notify_ready(ctx, c)
             await q.edit_message_text(f"✅ Афиша одобрена — *{c['artist']}*", parse_mode='Markdown')
 
@@ -559,7 +558,7 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
             txt = ctx.user_data.pop(f'v_{cid}', None)
             if txt:
                 c['description_text'] = txt
-                db_save(c); sheets.sync_concert(c)
+                db_save(c); sheets.sync_concert(c, _concerts)
                 await notify_ready(ctx, c)
                 await q.edit_message_text(f"✅ Текст добавлен — *{c['artist']}*", parse_mode='Markdown')
 
@@ -569,18 +568,18 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 d, t = val
                 c['date'] = d
                 if t: c['time'] = t
-                db_save(c); sheets.sync_concert(c)
+                db_save(c); sheets.sync_concert(c, _concerts)
                 await notify_ready(ctx, c)
                 await q.edit_message_text(f"✅ Дата установлена — *{c['artist']}*", parse_mode='Markdown')
 
         elif action == 'cancel':
             c['status'] = 'cancelled'
-            db_save(c); sheets.sync_concert(c)
+            db_save(c); sheets.sync_concert(c, _concerts)
             await q.edit_message_text(f"🚫 *{c['artist']}* — отменён", parse_mode='Markdown')
 
         elif action == 'publish':
             c['status'] = 'published'
-            db_save(c); sheets.sync_concert(c)
+            db_save(c); sheets.sync_concert(c, _concerts)
             slug = make_slug(c.get('artist', ''))
             page_url = f"https://mtbarmoscow.com/{slug}"
             await q.edit_message_text(
@@ -620,16 +619,17 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, name, d, t = data.split('|')
         cid = db_save({'artist': name, 'date': d or None, 'time': t or None})
         c   = db_get(cid)
+        sheets.sync_concert(c, _concerts)
         await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
 
     if data.startswith('new_confirm|'):
-        # cnew from free text: new_confirm|artist|date|time
         parts  = data.split('|')
         artist = parts[1]
         d      = parts[2] or None
         t      = parts[3] or None
         cid    = db_save({'artist': artist, 'date': d, 'time': t})
         c      = db_get(cid)
+        sheets.sync_concert(c, _concerts)
         await q.edit_message_text(card(c), reply_markup=edit_kb(cid), parse_mode='Markdown')
 
     if data.startswith('upd_date|'):
@@ -642,7 +642,7 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if c and d:
             c['date'] = d
             if t: c['time'] = t
-            db_save(c); sheets.sync_concert(c)
+            db_save(c); sheets.sync_concert(c, _concerts)
             await notify_ready(ctx, c)
             await q.edit_message_text(
                 f"✅ Дата *{c['artist']}* обновлена: `{d} {t or ''}`.strip()",
@@ -670,7 +670,7 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
         _, t = extract_date_time(text)
         c['date'] = d
         if t: c['time'] = t
-        db_save(c); sheets.sync_concert(c)
+        db_save(c); sheets.sync_concert(c, _concerts)
         await notify_ready(ctx, c)
         kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
         dt = f"{d} {t or ''}".strip()
@@ -692,7 +692,7 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
             c['date'] = d
             if t:
                 c['time'] = t
-                db_save(c); sheets.sync_concert(c)
+                db_save(c); sheets.sync_concert(c, _concerts)
                 await notify_ready(ctx, c)
                 kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
                 await upd.message.reply_text(
@@ -721,7 +721,7 @@ async def handle_awaiting(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     else:
         return False
 
-    db_save(c); sheets.sync_concert(c)
+    db_save(c); sheets.sync_concert(c, _concerts)
     await notify_ready(ctx, c)
     kb = [[InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_menu_{cid}")]]
     await upd.message.reply_text(
@@ -807,6 +807,7 @@ async def _create_or_warn(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
     cid = db_save({'artist': artist, 'date': d, 'time': t})
     c   = db_get(cid)
+    sheets.sync_concert(c, _concerts)
 
     # Если дата есть но времени нет — спросить время
     if d and not t:
@@ -1394,7 +1395,11 @@ async def morning_digest(ctx: ContextTypes.DEFAULT_TYPE):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    init_db()
+    global _concerts, _chats
+    # Загружаем данные из Google Sheets — это и есть наша БД
+    _concerts = sheets.load_all_concerts()
+    _chats    = sheets.load_chats()
+    logger.info(f"🎸 Загружено концертов: {len(_concerts)}, чатов: {len(_chats)}")
     app = Application.builder().token(TOKEN).build()
 
     for cmd, fn in [
