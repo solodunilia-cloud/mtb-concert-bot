@@ -1590,6 +1590,34 @@ def main():
     if jq:
         jq.run_daily(morning_digest, time=dtime(hour=9, minute=0))
 
+    async def set_commands(app):
+        await app.bot.set_my_commands([
+            ("new",    "Создать мероприятие"),
+            ("edit",   "Редактировать"),
+            ("list",   "Список мероприятий"),
+            ("status", "Статус карточки"),
+            ("cancel", "Отменить"),
+            ("digest", "Сводка"),
+            ("help",   "Помощь"),
+        ])
+        from telegram import BotCommandScopeChat
+        await app.bot.set_my_commands([
+            ("new",        "Создать мероприятие"),
+            ("edit",       "Редактировать"),
+            ("list",       "Список мероприятий"),
+            ("status",     "Статус карточки"),
+            ("cancel",     "Отменить"),
+            ("digest",     "Сводка"),
+            ("code",       "HTML для Tilda"),
+            ("publish",    "Опубликовать"),
+            ("rebuild",    "Пересобрать календари"),
+            ("notify_on",  "Включить дайджест"),
+            ("notify_off", "Выключить дайджест"),
+            ("help",       "Помощь"),
+        ], scope=BotCommandScopeChat(chat_id=OWNER_ID))
+
+    app.post_init = set_commands
+
     logger.info("🎸 MTB Concerts Bot v5 запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
