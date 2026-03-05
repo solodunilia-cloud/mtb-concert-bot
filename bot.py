@@ -111,6 +111,7 @@ def norm(text: str) -> str:
     text = text.lower()
     text = text.translate(_CYR_LAT)
     text = text.replace('ё', 'е')
+    text = text.replace('`', '').replace("'", '').replace('\u2019', '').replace('\u02bc', '')  # апострофы
     text = re.sub(r'[^\w\s]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
