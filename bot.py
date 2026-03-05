@@ -339,6 +339,24 @@ def parse_trigger(text: str) -> Optional[dict]:
         return None
     action, found_kw = result
 
+    # ✅ Для текста — парсим ДО/ПОСЛЕ ключевого слова СРАЗУ,
+    # до проверки длины артиста (иначе длинный текст убивает триггер)
+    if action == 'text':
+        for kw in KW['text']:
+            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+            m = pattern.search(text)
+            if m:
+                before = text[:m.start()].strip()
+                after  = text[m.end():].strip()
+                if after and len(before) >= 2:
+                    artist = before
+                    for sw in STOP_WORDS:
+                        artist = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', artist)
+                    artist = re.sub(r'\s+', ' ', artist).strip()
+                    if artist and len(artist) >= 2:
+                        return {'artist': artist, 'action': 'text', 'payload': after}
+        return None
+
     # Убираем URL, ключевые слова, даты — остаток = артист
     cleaned = re.sub(r'https?://\S+', '', text)
     all_kw  = [w for ws in KW.values() for w in ws] + POSTER_OK
@@ -363,30 +381,7 @@ def parse_trigger(text: str) -> Optional[dict]:
     url     = extract_url(text)
     payload = url or ''
 
-    if action == 'text':
-        # Артист — всё ДО ключевого слова, текст — всё ПОСЛЕ
-        for kw in KW['text']:
-            pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            m = pattern.search(text)
-            if m:
-                after  = text[m.end():].strip()
-                before = text[:m.start()].strip()
-                if after:
-                    payload = after
-                    if before and len(before) >= 2:
-                        artist = re.sub(r'\s+', ' ', before).strip()
-                    break
-        # fallback
-        if not payload:
-            text_n = norm(text)
-            kw_n   = norm(found_kw)
-            idx    = text_n.find(kw_n)
-            if idx != -1:
-                after = text[idx + len(found_kw):].strip()
-                if after:
-                    payload = after
-
-    elif action == 'tickets':
+    if action == 'tickets':
         # Артист — всё ДО ключевого слова (без URL)
         for kw in KW['tickets']:
             pattern = re.compile(re.escape(kw), re.IGNORECASE)
