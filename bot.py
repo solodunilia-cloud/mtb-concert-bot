@@ -339,24 +339,6 @@ def parse_trigger(text: str) -> Optional[dict]:
         return None
     action, found_kw = result
 
-    # ✅ Для текста — парсим ДО/ПОСЛЕ ключевого слова СРАЗУ,
-    # до проверки длины артиста (иначе длинный текст убивает триггер)
-    if action == 'text':
-        for kw in KW['text']:
-            pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            m = pattern.search(text)
-            if m:
-                before = text[:m.start()].strip()
-                after  = text[m.end():].strip()
-                if after and len(before) >= 2:
-                    artist = before
-                    for sw in STOP_WORDS:
-                        artist = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', artist)
-                    artist = re.sub(r'\s+', ' ', artist).strip()
-                    if artist and len(artist) >= 2:
-                        return {'artist': artist, 'action': 'text', 'payload': after}
-        return None
-
     # Убираем URL, ключевые слова, даты — остаток = артист
     cleaned = re.sub(r'https?://\S+', '', text)
     all_kw  = [w for ws in KW.values() for w in ws] + POSTER_OK
@@ -381,7 +363,30 @@ def parse_trigger(text: str) -> Optional[dict]:
     url     = extract_url(text)
     payload = url or ''
 
-    if action == 'tickets':
+    if action == 'text':
+        # Артист — всё ДО ключевого слова, текст — всё ПОСЛЕ
+        for kw in KW['text']:
+            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+            m = pattern.search(text)
+            if m:
+                after  = text[m.end():].strip()
+                before = text[:m.start()].strip()
+                if after:
+                    payload = after
+                    if before and len(before) >= 2:
+                        artist = re.sub(r'\s+', ' ', before).strip()
+                    break
+        # fallback
+        if not payload:
+            text_n = norm(text)
+            kw_n   = norm(found_kw)
+            idx    = text_n.find(kw_n)
+            if idx != -1:
+                after = text[idx + len(found_kw):].strip()
+                if after:
+                    payload = after
+
+    elif action == 'tickets':
         # Артист — всё ДО ключевого слова (без URL)
         for kw in KW['tickets']:
             pattern = re.compile(re.escape(kw), re.IGNORECASE)
@@ -497,10 +502,15 @@ async def process_trigger(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, parsed: d
     action = parsed['action']
     payload= parsed['payload']
 
+    # ✅ Храним payload в user_data — callback_data ограничен 64 байтами
+    import hashlib
+    pkey = 'p_' + hashlib.md5(payload.encode()).hexdigest()[:12]
+    ctx.user_data[pkey] = payload
+
     matches = fuzzy_find(name)
 
     if not matches:
-        kb = [[InlineKeyboardButton("✅ Создать", callback_data=f"cnew|{name}|{action}|{payload[:80]}"),
+        kb = [[InlineKeyboardButton("✅ Создать", callback_data=f"cnew|{name}|{action}|{pkey}"),
                InlineKeyboardButton("❌ Отмена",  callback_data="noop")]]
         await msg.reply_text(f"*{name}* не найден.\nСоздать новое мероприятие?",
                              reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
@@ -509,7 +519,7 @@ async def process_trigger(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, parsed: d
     if len(matches) > 1:
         kb = [[InlineKeyboardButton(
             f"#{c['id']} {c['artist']}" + (f" • {c['date']}" if c.get('date') else ''),
-            callback_data=f"tsel|{c['id']}|{action}|{payload[:80]}"
+            callback_data=f"tsel|{c['id']}|{action}|{pkey}"
         )] for c in matches]
         kb.append([InlineKeyboardButton("❌ Отмена", callback_data="noop")])
         await msg.reply_text("Найдено несколько — уточни:",
@@ -530,7 +540,9 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith('cnew|'):
-        _, name, action, payload = data.split('|', 3)
+        _, name, action, pkey = data.split('|', 3)
+        # ✅ Достаём payload из user_data по ключу
+        payload = ctx.user_data.pop(pkey, '')
         cid = db_save({'artist': name})
         c   = db_get(cid)
         sheets.sync_concert(c, _concerts)
@@ -539,7 +551,9 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith('tsel|'):
-        _, cid_s, action, payload = data.split('|', 3)
+        _, cid_s, action, pkey = data.split('|', 3)
+        # ✅ Достаём payload из user_data по ключу
+        payload = ctx.user_data.pop(pkey, '')
         c = db_get(int(cid_s))
         await q.edit_message_text(f"#{c['id']} {c['artist']}")
         await apply_action(upd, ctx, c, action, payload)
