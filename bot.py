@@ -330,79 +330,89 @@ STOP_WORDS = [
 ]
 
 def parse_trigger(text: str) -> Optional[dict]:
-    """Любой порядок: Артист билеты URL / билеты Артист URL / и т.д."""
+    """Любой порядок: Артист билеты URL / билеты Артист URL / и т.д.
+    Для триггера 'текст' — артист и ключевое слово на первой строке,
+    описание — всё после ключевого слова (может быть многострочным).
+    """
     text = text.strip()
     if not text:
         return None
-    result = detect_kw(text)
+
+    # Для поиска ключевого слова и артиста используем только первую строку
+    lines      = text.split('\n')
+    first_line = lines[0].strip()
+
+    result = detect_kw(first_line)
+    if not result:
+        # Попробуем весь текст (вдруг ключевое слово не в первой строке)
+        result = detect_kw(text.replace('\n', ' '))
     if not result:
         return None
     action, found_kw = result
 
-    # Убираем URL, ключевые слова, даты — остаток = артист
-    cleaned = re.sub(r'https?://\S+', '', text)
-    all_kw  = [w for ws in KW.values() for w in ws] + POSTER_OK
-    for kw in all_kw:
-        cleaned = re.sub(r'(?i)\b' + re.escape(kw) + r'\b', '', cleaned)
-    cleaned = strip_date_time(cleaned)
-
-    # Убираем стоп-слова (мусор)
-    for sw in STOP_WORDS:
-        cleaned = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', cleaned)
-
-    artist = re.sub(r'\s+', ' ', cleaned).strip()
-
-    if not artist or len(artist) < 2:
-        return None
-
-    # Защита от мусора — слишком длинное "имя артиста"
-    if len(artist.split()) > 6:
-        return None
-
-    # URL всегда берём из исходного текста
+    # URL берём из всего текста
     url     = extract_url(text)
     payload = url or ''
 
     if action == 'text':
-        # Артист — всё ДО ключевого слова, текст — всё ПОСЛЕ
+        # Ищем ключевое слово в первой строке → артист ДО, текст ПОСЛЕ + следующие строки
         for kw in KW['text']:
             pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            m = pattern.search(text)
+            m = pattern.search(first_line)
             if m:
-                after  = text[m.end():].strip()
-                before = text[:m.start()].strip()
-                if after:
-                    payload = after
+                before     = first_line[:m.start()].strip()
+                after_kw   = first_line[m.end():].strip()
+                # Текст = то что после ключевого слова на первой строке + все остальные строки
+                rest_lines = '\n'.join(lines[1:]).strip()
+                full_text  = (after_kw + '\n' + rest_lines).strip() if rest_lines else after_kw
+                if full_text:
+                    payload = full_text
+                if before and len(before) >= 2:
+                    artist = re.sub(r'\s+', ' ', before).strip()
+                else:
+                    # Ключевое слово в начале строки, артист неизвестен — вернём None
+                    # чтобы бот не создавал пустого артиста
+                    if not before:
+                        return None
+                break
+        else:
+            return None
+
+    else:
+        # Для остальных триггеров — работаем с первой строкой
+        cleaned = re.sub(r'https?://\S+', '', first_line)
+        all_kw  = [w for ws in KW.values() for w in ws] + POSTER_OK
+        for kw in all_kw:
+            cleaned = re.sub(r'(?i)\b' + re.escape(kw) + r'\b', '', cleaned)
+        cleaned = strip_date_time(cleaned)
+        for sw in STOP_WORDS:
+            cleaned = re.sub(r'(?i)\b' + re.escape(sw) + r'\b', '', cleaned)
+        artist = re.sub(r'\s+', ' ', cleaned).strip()
+
+        if not artist or len(artist) < 2:
+            return None
+        if len(artist.split()) > 6:
+            return None
+
+        if action == 'tickets':
+            for kw in KW['tickets']:
+                pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                m = pattern.search(first_line)
+                if m:
+                    before = re.sub(r'https?://\S+', '', first_line[:m.start()]).strip()
                     if before and len(before) >= 2:
                         artist = re.sub(r'\s+', ' ', before).strip()
                     break
-        # fallback
-        if not payload:
-            text_n = norm(text)
-            kw_n   = norm(found_kw)
-            idx    = text_n.find(kw_n)
-            if idx != -1:
-                after = text[idx + len(found_kw):].strip()
-                if after:
-                    payload = after
 
-    elif action == 'tickets':
-        # Артист — всё ДО ключевого слова (без URL)
-        for kw in KW['tickets']:
-            pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            m = pattern.search(text)
-            if m:
-                before = re.sub(r'https?://\S+', '', text[:m.start()]).strip()
-                if before and len(before) >= 2:
-                    artist = re.sub(r'\s+', ' ', before).strip()
-                break
+        elif action == 'date':
+            d, t    = extract_date_time(first_line)
+            payload = f"{d or ''} {t or ''}".strip()
 
-    elif action == 'date':
-        d, t    = extract_date_time(text)
-        payload = f"{d or ''} {t or ''}".strip()
+        elif action == 'poster':
+            payload = first_line
 
-    elif action == 'poster':
-        payload = text
+    if not artist or len(artist) < 2:
+        return None
 
     return {'artist': artist, 'action': action, 'payload': payload}
 
