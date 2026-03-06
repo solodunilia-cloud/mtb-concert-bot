@@ -299,6 +299,82 @@ async def notify_ready(ctx: ContextTypes.DEFAULT_TYPE, c: dict):
         except Exception as e:
             logger.error(f"notify: {e}")
 
+# ─── АВТОУДАЛЕНИЕ И УМНЫЙ ОТВЕТ ───────────────────────────────────────────────
+
+async def _auto_delete(bot, chat_id: int, message_id: int, delay: int = 3):
+    """Удаляет сообщение бота через delay секунд."""
+    import asyncio
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+async def _reply(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
+                 reply_markup=None, parse_mode='Markdown', auto_delete=True):
+    """
+    Отвечает на сообщение.
+    В группе — удаляет ответ бота через 3 сек (чат чистый).
+    В личке — не удаляет.
+    """
+    msg = await upd.effective_message.reply_text(
+        text, reply_markup=reply_markup, parse_mode=parse_mode
+    )
+    chat_type = upd.effective_chat.type if upd.effective_chat else 'private'
+    if auto_delete and chat_type in ('group', 'supergroup'):
+        import asyncio
+        asyncio.ensure_future(_auto_delete(ctx.bot, msg.chat_id, msg.message_id, delay=3))
+    return msg
+
+# ─── НАПОМИНАЛКИ ──────────────────────────────────────────────────────────────
+
+async def _send_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    data = ctx.job.data
+    try:
+        await ctx.bot.send_message(
+            chat_id=data['chat_id'],
+            text=f"🔔 *Напоминание*\n\n{data['note']}",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"send_reminder: {e}")
+
+async def _concert_end_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    data = ctx.job.data
+    try:
+        await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"🎤 *{data['artist']}* — концерт завершился!\n\nНе забудь снять с сайта 👇",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"concert_end_reminder: {e}")
+
+def schedule_concert_reminder(job_queue, c: dict):
+    """Планирует напоминание снять концерт через 1 час после начала (или в 21:00)."""
+    if not c.get('date'):
+        return
+    try:
+        from datetime import datetime as _dt
+        dt = _dt.strptime(c['date'], '%d.%m.%Y')
+        if c.get('time'):
+            th, tm = map(int, c['time'].split(':'))
+            remind_dt = dt.replace(hour=min(th + 1, 23), minute=tm)
+        else:
+            remind_dt = dt.replace(hour=21, minute=0)
+        if remind_dt > _dt.now():
+            job_name = f"concert_end_{c['id']}"
+            for job in job_queue.get_jobs_by_name(job_name):
+                job.schedule_removal()
+            job_queue.run_once(
+                _concert_end_reminder,
+                when=remind_dt,
+                data={'artist': c['artist']},
+                name=job_name
+            )
+    except Exception as e:
+        logger.error(f"schedule_concert_reminder: {e}")
+
 # ─── ПАРСИНГ ТРИГГЕРА ─────────────────────────────────────────────────────────
 
 def detect_kw(text: str) -> Optional[Tuple[str, str]]:
@@ -443,48 +519,41 @@ async def apply_action(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
     if action == 'cancel':
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|cancel|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"Отменить *{name}*?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"Отменить *{name}*?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif action == 'tickets':
         url = extract_url(payload) or extract_url(upd.effective_message.text or '')
         if not url:
-            await msg.reply_text(f"Нет ссылки.\nПример: `{name} билеты https://...`",
-                                 parse_mode='Markdown')
+            await _reply(upd, ctx, f"Нет ссылки.\nПример: `{name} билеты https://...`")
             return
         ctx.user_data[f'v_{cid}'] = url
         label = "Перезаписать билеты" if c.get('tickets_url') else "Добавить билеты"
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|tickets|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"{label} для *{name}*?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"{label} для *{name}*?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif action == 'poster':
         if not any(norm(w) in norm(payload) for w in POSTER_OK):
-            await msg.reply_text(f"Напиши: `{name} афиша одобрена`", parse_mode='Markdown')
+            await _reply(upd, ctx, f"Напиши: `{name} афиша одобрена`")
             return
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|poster|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"Отметить афишу *{name}* как одобренную?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"Отметить афишу *{name}* как одобренную?", reply_markup=InlineKeyboardMarkup(kb))
 
     elif action == 'text':
         if len(payload) < 10:
-            await msg.reply_text(f"Текст слишком короткий.\nПример: `{name} текст Описание...`",
-                                 parse_mode='Markdown')
+            await _reply(upd, ctx, f"Текст слишком короткий.\nПример: `{name} текст Описание...`")
             return
         ctx.user_data[f'v_{cid}'] = payload
         preview = payload[:100] + ('...' if len(payload) > 100 else '')
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|text|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"Добавить текст для *{name}*?\n\n_{preview}_",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"Добавить текст для *{name}*?\n\n_{preview}_", reply_markup=InlineKeyboardMarkup(kb))
 
     elif action == 'date':
         d, t = extract_date_time(payload + ' ' + (upd.effective_message.text or ''))
         if not d:
-            await msg.reply_text(f"Не распознал дату.\nПример: `{name} дата 15.04.2026 21:00`",
-                                 parse_mode='Markdown')
+            await _reply(upd, ctx, f"Не распознал дату.\nПример: `{name} дата 15.04.2026 21:00`")
             return
         ctx.user_data[f'v_{cid}'] = (d, t)
         dt = f"{d} {t or ''}".strip()
@@ -492,38 +561,35 @@ async def apply_action(upd: Update, ctx: ContextTypes.DEFAULT_TYPE,
             # Спрашиваем время отдельно
             ctx.user_data[f'aw_time_{cid}'] = d
             kb = [[InlineKeyboardButton("Пропустить", callback_data=f"do|date|{cid}")]]
-            await msg.reply_text(
-                f"Дата *{name}*: `{d}`\nВведи время (например `21:00`) или пропусти:",
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
-            )
+            await _reply(upd, ctx, f"Дата *{name}*: `{d}`\nВведи время (например `21:00`) или пропусти:", reply_markup=InlineKeyboardMarkup(kb))
             ctx.user_data['aw']    = 'time_for_date'
             ctx.user_data['aw_id'] = cid
             return
         kb = [[InlineKeyboardButton("✅ Да",  callback_data=f"do|date|{cid}"),
                InlineKeyboardButton("❌ Нет", callback_data="noop")]]
-        await msg.reply_text(f"Установить дату *{name}*: `{dt}`?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"Установить дату *{name}*: `{dt}`?", reply_markup=InlineKeyboardMarkup(kb))
 
 # ─── ОБРАБОТКА ТРИГГЕРА ───────────────────────────────────────────────────────
 
 async def process_trigger(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    msg    = upd.effective_message
     name   = parsed['artist']
     action = parsed['action']
     payload= parsed['payload']
 
-    # ✅ Храним payload в user_data — callback_data ограничен 64 байтами
     import hashlib
     pkey = 'p_' + hashlib.md5(payload.encode()).hexdigest()[:12]
     ctx.user_data[pkey] = payload
 
-    matches = fuzzy_find(name)
+    matches   = fuzzy_find(name)
+    is_group  = upd.effective_chat.type in ('group', 'supergroup') if upd.effective_chat else False
 
     if not matches:
+        if is_group:
+            return  # В группе молчим — артиста нет в базе
         kb = [[InlineKeyboardButton("✅ Создать", callback_data=f"cnew|{name}|{action}|{pkey}"),
                InlineKeyboardButton("❌ Отмена",  callback_data="noop")]]
-        await msg.reply_text(f"*{name}* не найден.\nСоздать новое мероприятие?",
-                             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await _reply(upd, ctx, f"*{name}* не найден.\nСоздать новое мероприятие?",
+                     reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if len(matches) > 1:
@@ -532,8 +598,7 @@ async def process_trigger(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, parsed: d
             callback_data=f"tsel|{c['id']}|{action}|{pkey}"
         )] for c in matches]
         kb.append([InlineKeyboardButton("❌ Отмена", callback_data="noop")])
-        await msg.reply_text("Найдено несколько — уточни:",
-                             reply_markup=InlineKeyboardMarkup(kb))
+        await _reply(upd, ctx, "Найдено несколько — уточни:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     await apply_action(upd, ctx, matches[0], action, payload)
@@ -630,6 +695,9 @@ async def on_callback(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"⚫ *{c['artist']}* — опубликован\n\n🔗 Ссылка для рекламы:\n{page_url}",
                 parse_mode='Markdown'
             )
+            # Планируем напоминалку снять с сайта после концерта
+            if ctx.job_queue:
+                schedule_concert_reminder(ctx.job_queue, c)
 
         elif action == 'delete':
             name = c['artist']
@@ -1366,6 +1434,56 @@ async def cmd_code(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (upd.message.text or '').strip()
 
+    # ─── НАПОМИНАЛКА — только для владельца ────────────────────────────────
+    if upd.effective_user and upd.effective_user.id == OWNER_ID:
+        remind_kw = ['напомни', 'напоминание', 'remind']
+        if any(kw in text.lower() for kw in remind_kw):
+            d, t = extract_date_time(text)
+            note = text
+            for kw in remind_kw:
+                note = re.sub(r'(?i)\b' + kw + r'\b', '', note)
+            note = strip_date_time(note).strip() or 'Напоминание'
+
+            # Контекст из цитаты
+            quoted = ''
+            if upd.message.reply_to_message:
+                qt    = upd.message.reply_to_message
+                qfrom = qt.from_user.first_name if qt.from_user else ''
+                qtext = (qt.text or qt.caption or '')[:200]
+                quoted = f"\n\n💬 {qfrom}:\n{qtext}"
+
+            if d:
+                try:
+                    from datetime import datetime as _dt
+                    remind_dt = _dt.strptime(d, '%d.%m.%Y')
+                    if t:
+                        th, tm = map(int, t.split(':'))
+                        remind_dt = remind_dt.replace(hour=th, minute=tm)
+                    else:
+                        remind_dt = remind_dt.replace(hour=9, minute=0)
+                    ctx.job_queue.run_once(
+                        _send_reminder,
+                        when=remind_dt,
+                        data={'note': note + quoted, 'chat_id': OWNER_ID},
+                        name=f"remind_{OWNER_ID}_{d}_{t or ''}"
+                    )
+                    dt_str = f"{d} {t or '09:00'}"
+                    sent = await upd.message.reply_text(f"🔔 Напоминание: `{dt_str}`\n_{note}_",
+                                                        parse_mode='Markdown')
+                    chat_type = upd.effective_chat.type if upd.effective_chat else 'private'
+                    if chat_type in ('group', 'supergroup'):
+                        import asyncio
+                        asyncio.ensure_future(_auto_delete(ctx.bot, sent.chat_id, sent.message_id, 5))
+                    return
+                except Exception as e:
+                    logger.error(f"remind: {e}")
+            else:
+                await upd.message.reply_text(
+                    "Укажи дату. Пример:\n`напомни 15.04 21:00 снять с сайта`",
+                    parse_mode='Markdown'
+                )
+                return
+
     # Ожидание имени при /new
     if ctx.user_data.get('aw') == 'create_name':
         ctx.user_data.pop('aw'); ctx.user_data.pop('aw_id', None)
@@ -1437,6 +1555,25 @@ async def on_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
                 )
 
+
+async def cmd_sync(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Перечитывает данные из Google Sheets — только для владельца."""
+    if upd.effective_user.id != OWNER_ID:
+        return
+    global _concerts, _chats
+    msg = await upd.message.reply_text("🔄 Синхронизирую с Google Sheets...")
+    try:
+        _concerts = sheets.load_all_concerts()
+        _chats    = sheets.load_chats()
+        if ctx.job_queue:
+            for c in _concerts:
+                if c.get('status') == 'published':
+                    schedule_concert_reminder(ctx.job_queue, c)
+        await msg.edit_text(
+            f"✅ Готово!\nКонцертов: {len(_concerts)} | Чатов: {len(_chats)}"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
 
 async def cmd_rebuild(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Пересобирает все календари и чистит имена артистов в Sheets."""
@@ -1580,6 +1717,7 @@ def main():
         ('notify_on',  cmd_notify_on),
         ('notify_off', cmd_notify_off),
         ('rebuild',    cmd_rebuild),
+        ('sync',       cmd_sync),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
 
@@ -1611,6 +1749,7 @@ def main():
             ("code",       "HTML для Tilda"),
             ("publish",    "Опубликовать"),
             ("rebuild",    "Пересобрать календари"),
+            ("sync",       "Синхронизировать с Sheets"),
             ("notify_on",  "Включить дайджест"),
             ("notify_off", "Выключить дайджест"),
             ("help",       "Помощь"),
