@@ -308,17 +308,17 @@ async def auto_delete(msg, delay: int = 3):
     except Exception:
         pass
 
-async def reply_and_delete(msg, text, delay=3, **kwargs):
+async def reply_and_delete(msg, text, delay=5, **kwargs):
     """Отправить сообщение и удалить через delay секунд."""
-    sent = await reply_and_delete(msg, text, **kwargs)
-    asyncio.create_task(auto_delete(sent, delay))
+    sent = await msg.reply_text(text, **kwargs)
+    asyncio.get_event_loop().create_task(auto_delete(sent, delay))
     return sent
 
-async def edit_and_delete(q, text, delay=3, **kwargs):
+async def edit_and_delete(q, text, delay=5, **kwargs):
     """Отредактировать сообщение и удалить через delay секунд."""
     try:
-        await edit_and_delete(q, text, **kwargs)
-        asyncio.create_task(auto_delete(q.message, delay))
+        await q.edit_message_text(text, **kwargs)
+        asyncio.get_event_loop().create_task(auto_delete(q.message, delay))
     except Exception:
         pass
 
